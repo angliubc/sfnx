@@ -1,5 +1,11 @@
 # sFNX development
 
+> **This fork is the mainline since 2026-11-19** (upstream `johnfink8/sfnx` frozen since 11-07). Read
+> **`docs/MAINLINE.md` first**: it maps every delta (the in-engine ViT tower, the prefill/decode hand-off, the f32
+> `hc_inject`, the front's slot accounting), the exact build/run commands, the measured evidence, the pitfalls, and
+> **where production diverges from this tree** — rolling to production without reading it will break a live service.
+> Everything below is upstream's own discipline and still holds.
+
 sFNX is a from-scratch CUDA inference engine for one model (Qwen3.8-Flash-Next) on one kind of box: three Tesla
 V100-32GB cards on PCIe Gen3 with no NVLink (sm_70, CUDA 12.9, gcc 14). It splits **every layer** across all three
 cards (experts by FF width, recurrent heads, K/V by position, the vocabulary) so one request uses all three cards'
