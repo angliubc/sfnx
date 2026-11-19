@@ -54,7 +54,7 @@ unit() {   # name log env... -- command...; the cards: the first FNX_NCARD of th
     sudo systemctl reset-failed "$name" 2> /dev/null
     sudo systemd-run --unit="$name" -p LimitMEMLOCK=infinity --uid="$(id -u)" --gid="$(id -g)" -p WorkingDirectory="$(pwd)" \
         -p StandardOutput=append:"$log" -p StandardError=append:"$log" -E FNX_LAB_DIR="$DIR" -E CUDA_DEVICE_ORDER=PCI_BUS_ID \
-        -E CUDA_VISIBLE_DEVICES="$(seq -s, 0 $((ncard - 1)))" "$@" > /dev/null 2>&1
+        -E CUDA_VISIBLE_DEVICES="${FNX_LAB_GPUS:-$(seq -s, 0 $((ncard - 1)))}" "$@" > /dev/null 2>&1
 }
 wait_for() {   # unit log pattern tries (a fifth of a second each)
     for _ in $(seq "$4"); do
@@ -80,11 +80,7 @@ hold() {   # model
     [ "$cold" -gt 1 ] && echo "($cold GB of the model are not in the page cache: ~$(awk -v c="$cold" -v r="$rate" 'BEGIN {printf "%.0f", c / r}') s to read them at $rate GB/s${last:+; the last load: $last})"
     : > "$HLOG"
     echo "$1" > "$DIR/hold.model"
-    # the holder runs no kernels and makes no read pool, so it never reads the n-gram table: left on the disk
-    # (FNX_NGRAM=disk), each worker places it by its own FNX_NGRAM. Locked here too, Q8's 55 GB beside its NUMA-bound expert copies left card 2's
-    # node without room for them ("store: create (1024 MiB at location 5): out of memory"). A caller's FNX_NGRAM wins:
-    # on a rotational disk, where disk mode refuses, FNX_NGRAM=ram is the way through
-    unit fnx-hold "$HLOG" -E FNX_NGRAM="${FNX_NGRAM:-disk}" -- "$(pwd)/bin/fnx_hold" "$1" "$SOCK"
+    unit fnx-hold "$HLOG" -- "$(pwd)/bin/fnx_hold" "$1" "$SOCK"
     wait_for fnx-hold "$HLOG" "^== holding" 6000 || return 1
     # for the next estimate: the disk rate when the disk gave nearly all of the weights, and how long this load took
     r=$(sed -n 's/.*GB from the disk at \([0-9.]*\) GB\/s.*/\1/p' "$HLOG" | tail -1)
