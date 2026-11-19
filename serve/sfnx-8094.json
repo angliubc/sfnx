@@ -1,0 +1,75 @@
+{
+ "exe": "bin/sfnx",
+ "args": [
+  "--native",
+  "models/UD-Q4_K_XL-Q8Top16/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+  "--mtp",
+  "data/mtp-rt",
+  "--draft-vocab",
+  "data/mtp-rt/draft_vocab.bin",
+  "--max-context",
+  "1001390",
+  "--spec",
+  "6",
+  "--lookup",
+  "15",
+  "--conversation-cache-mib",
+  "65536",
+  "--batch",
+  "4",
+  "--rope-scale",
+  "3.82",
+  "--vision",
+  "--vision-model",
+  "models/mmproj-F16.gguf"
+ ],
+ "cwd": ".",
+ "env": {
+  "FNX_MTP_EXPERTS": "q4_0",
+  "FNX_YARN_ORIG_CTX": "262144",
+  "FNX_EXPERT_PROFILE": "/data/sfnx-prod/data/expert-routes.bin",
+  "FNX_PF_ROWS": "4176",
+  "FNX_ARENA_RESERVE_MIB": "1250"
+ },
+ "tokenizer": "data/tokenizer",
+ "model_name": "qwen3.8-flash-next",
+ "log": "serve/sfnx-8094.log",
+ "lib_dirs": [
+  "/usr/local/cuda-12.9/bin",
+  "/usr/local/cuda-12.9/lib64"
+ ],
+ "port": 8094,
+ "host": "0.0.0.0",
+ "gpu": [
+  4,
+  5,
+  6,
+  7
+ ],
+ "sampling": {
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "top_k": 20,
+  "min_p": 0.05,
+  "presence_penalty": 0.0
+ },
+ "reasoning_close_retry": true,
+ "vision": {
+  "engine_tower": true,
+  "mmproj": "models/mmproj-F16.gguf",
+  "max_tokens": 1024
+ },
+ "pd_role": "D",
+ "pd_peer_prefill": 3601,
+ "pd_peer_timeout": 300,
+ "pd_dir": "/dev/shm/pd-dumps",
+ "pd_stream": true,
+ "pd_stream_host": "<FLEET_HOST>",
+ "pd_peers": [
+  "http://<FLEET_HOST>:8093",
+  "http://<FLEET_HOST>:8094",
+  "http://<FLEET_HOST>:8093",
+  "http://<FLEET_HOST>:8094"
+ ],
+ "premature_stop_retry": true
+}

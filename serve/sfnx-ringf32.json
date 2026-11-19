@@ -1,0 +1,50 @@
+{
+ "exe": "bin/sfnx",
+ "args": [
+  "--native",
+  "models/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+  "--mtp",
+  "data/mtp-rt",
+  "--draft-vocab",
+  "data/draft_vocab_en.bin",
+  "--max-context",
+  "1001390",
+  "--spec",
+  "6",
+  "--lookup",
+  "15",
+  "--conversation-cache-mib",
+  "32768",
+  "--batch",
+  "6",
+  "--rope-scale",
+  "3.82"
+ ],
+ "cwd": ".",
+ "env": {
+  "FNX_MTP_EXPERTS": "q2_0",
+  "FNX_YARN_ORIG_CTX": "262144",
+  "FNX_RING_F32": "1"
+ },
+ "tokenizer": "data/tokenizer",
+ "model_name": "qwen3.8-flash-next",
+ "log": "serve/sfnx-ringf32.log",
+ "lib_dirs": [
+  "/usr/local/cuda/bin",
+  "/usr/local/cuda/lib64"
+ ],
+ "port": 8095,
+ "host": "0.0.0.0",
+ "gpu": [
+  4,
+  5,
+  6,
+  7
+ ],
+ "sampling": {
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "presence_penalty": 1.0
+ },
+ "reasoning_close_retry": true
+}
