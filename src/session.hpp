@@ -114,6 +114,9 @@ public:
     // conversation again, exactly as it was
     std::shared_ptr<Engine::SeqState> unload();
     void reload(const Engine::SeqState& s);
+    // reload a PLOAD'd dump, plus a checkpoint at the dump's end taken from the engine: the dump's bytes carry no
+    // checkpoints, and without one the conversation parks with nothing to restore to - its next turn re-reads all
+    void reload_dump(const Engine::SeqState& s);
     bool speculate = true;   // false: one row a window, no drafts (the reference the speculative sampler must match)
     // up to max_new tokens after the prompt; emit(token) for each, in order (the stopping token included); stop: checked
     // between windows. The engine keeps every emitted token but the last

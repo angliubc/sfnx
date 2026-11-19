@@ -47,10 +47,6 @@ public:
     // the same without advancing: a speculative window (the last token, then drafts). commit(n) keeps its first n rows
     // (1 <= n <= T): the state is cut back to after row n - 1, pos() advances by n. Every verify needs its commit.
     std::vector<int> verify(const std::vector<int>& tokens);
-    // the n-gram rows verify(tokens) will read, read ahead into the cache (FNX_NGRAM=disk: decode's next window as its
-    // tokens become known, while the draft layer runs); nothing in RAM mode or for the 27B
-    void ngram_prefetch(const std::vector<int>& tokens) const;
-    bool ngram_reads_ahead() const;   // ngram_prefetch reads anything: PleRows::reads_ahead, Flash-Next
     void commit(int n);
     // the last window's head logits, T rows of the whole vocabulary (the cards' slices put together)
     std::vector<float> last_logits(int T) const;
@@ -192,6 +188,17 @@ private:
     // the rotary's constants, YaRN's included when scaled, set at construction (before any graph capture: they ride
     // into the graphs as kernel arguments). rope_of hands a kernel them with that call's M-RoPE table
     Rope rope_;
+    // PD (the prefill hand-off): a hand-off's K/V is computed with the plain rotary (the decode side's own,
+    // unscaled), whatever scaling this engine runs, so a dump crosses the two; set per read (rope_std_next),
+    // every rope_of honouring it while it is on.  The bit joins graph_key: the two rotaries' window graphs are
+    // captured apart (a mismatch would replay the other's baked-in frequencies).
+    Rope rope_std_;
+    bool rope_std_next_ = false;
+public:
+    void rope_std_next(bool on) { rope_std_next_ = on; }
+    bool rope_scaled() const { return rope_.scaled; }   // PD: a dump made on the plain rotary must not load onto a YaRN engine
+private:
+    Rope rope_cur(const int* tab) const { Rope r = rope_std_next_ ? rope_std_ : rope_; r.tab = tab; return r; }
     Rope rope_of(const int* tab) const { Rope r = rope_; r.tab = tab; return r; }
     unsigned tag_ = 1;            // the current lane's last window tag (its parity: the recurrent history half)
     unsigned tag_max_ = 1;        // the largest tag any window has used (tags rise across lanes: the ring sums tell
@@ -248,9 +255,6 @@ private:
         float* mtp_emb;
         int* mtp_ctl;
         float* ple;
-        float* ngram_late;     // FNX_NGRAM=disk, verify: the window's n-gram rows, mapped (the cards read them in place)
-        unsigned* ngram_flag;  // mapped: the window's tag once ngram_late holds its rows, ~tag until then. verify sets
-                               // it around its launch, the window graphs' only one: another launch site must too
         int* ctl;
         float* bv;
         int* bi;
@@ -270,22 +274,10 @@ private:
         unsigned* err = nullptr;
         float* par = nullptr;   // per row: repeat, freq, present
     } tk_;
-    // a window's rows r .. r + k - 1 in its page-locked inputs (h_.R0, and what else the model reads), for positions
-    // p0 .. p0 + k - 1 (tok_at: the token at a position); batched: the caller's name when the rows are a batched
-    // window's (null for one lane's), which a model refuses rows in by that name. rows_upload: a window's T rows to b
-    void embed_into(int r, int k, int p0, const std::function<int(int)>& tok_at, const char* batched);
-    void rows_upload(CardBuf& b, int T);
-    // verify with the n-gram table on the disk (Flash-Next, FNX_NGRAM=disk; never the 27B): the window is launched with
-    // its token rows only (embed_tokens_into, rows_upload_tokens) and layer 1 waits on the cards for ngram_rows_late,
-    // which the host reads after the launch, behind layer 0
-    bool ngram_late() const;
-    void embed_tokens_into(int r, int k, int p0, const std::function<int(int)>& tok_at);
-    void rows_upload_tokens(CardBuf& b, int T);
-    void ngram_rows_late(int k, int p0, const std::function<int(int)>& tok_at, unsigned tag);
+    void embed(const std::vector<int>& tokens, std::vector<float>& R0, std::vector<float>& ple) const;
     // rows at positions p0 .. p0 + T - 1 (tok_at: the token at a position, for the row's and the PLE n-grams'): the
     // token embedding (one stream, rows of N) and the PLE rows (rows of N)
     void embed_rows(int p0, int T, const std::function<int(int)>& tok_at, float* emb, float* ple) const;
-    void ple_dequant(int p0, int T, const std::function<int(int)>& tok_at, float* ple) const;   // Flash-Next: embed_rows' PLE half
     void embed_token(int tok, int cell, float* out) const;   // one token's embedding (N); an image cell's row
     std::vector<int> graph_key(const std::vector<int>& lanes) const;   // a window graph's: the lanes, their tables, cache_live()
     // the expert cache can miss: experts in RAM, or an arena lending (with nothing lent every expert is in a slot and
@@ -335,12 +327,6 @@ private:
     void attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
                    uint16_t* qsa_ring, uint16_t* qsa_pooled, int call);
     void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl);
-#if FNX_27B
-    // the 27B's window (s27_engine.cu): the layers and head over T rows, one sequence's or a batched window's (lanes),
-    // with the recurrent core each kind runs
-    using GdnFn = std::function<void(CardBuf&, const CardW&, const LayerW&, int)>;
-    void enqueue_layers(int T, bool lanes, const GdnFn& gdn, bool dumps);
-#endif
 };
 
 }  // namespace fnx

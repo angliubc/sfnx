@@ -32,7 +32,6 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -45,6 +44,7 @@
 #include "../src/engine.hpp"
 #include "../src/env.hpp"
 #include "../src/session.hpp"
+#include "../src/vit.hpp"
 #include "sfnx_input.hpp"
 
 namespace {
@@ -63,10 +63,11 @@ void say(const std::string& line) {
 }
 
 struct Args {
-    std::string gguf, mtp_dir, draft_vocab;
+    std::string gguf, mtp_dir, draft_vocab, vision_model;
     int max_ctx = 262144, K = 6, lookup = 15, batch = 1;
     long cache_mib = 0;   // checkpoints and parked conversations in host memory (0: none)
-    bool vision = false;  // GENI / BGENI: prompts with images (embeddings from sfnx-vision)
+    bool vision = false;  // GENI / BGENI: prompts with images (embeddings from the in-engine tower)
+    int vision_max_tokens = 1024;   // --vision-model: the tower's buffers' merged-token cap
 };
 
 Args parse_args(int argc, char** argv) {
@@ -95,10 +96,14 @@ Args parse_args(int argc, char** argv) {
             ::setenv("FNX_ROPE_SCALE", s.c_str(), 1);
         }
         else if (k == "--vision") a.vision = true;
+        else if (k == "--vision-model") a.vision_model = val();
+        else if (k == "--vision-max-tokens") a.vision_max_tokens = std::stoi(val());
         else throw std::runtime_error("unknown argument " + k);
     }
     if (!serve) throw std::runtime_error("sfnx runs as --serve");
     if (a.gguf.empty() || a.mtp_dir.empty()) throw std::runtime_error("--native and --mtp are required");
+    if (a.vision && a.vision_model.empty())
+        throw std::runtime_error("--vision needs --vision-model (the mmproj the in-engine tower loads)");
     if (a.batch < 1 || a.batch > MAX_SLOTS) throw std::runtime_error("--batch must be 1.." + std::to_string(MAX_SLOTS));
     fnx::rope_scale();   // a bad scale stops here, not after the minute of loading (the context's limit needs the model)
     return a;
@@ -378,6 +383,7 @@ struct Server {
     fnx::Model& m;
     fnx::Engine& e;
     Input& in;
+    fnx::Vit* vit = nullptr;   // --vision-model: the in-engine tower (pictures encode through ENC before their read)
     std::shared_ptr<fnx::ConvCache> cache;
     std::vector<Slot> slots;
     long clock = 0;
@@ -432,7 +438,8 @@ struct Server {
         e.arena_reclaim();
     }
 
-    Server(const Args& args, fnx::Model& model, fnx::Engine& eng, Input& input) : a(args), m(model), e(eng), in(input) {
+    Server(const Args& args, fnx::Model& model, fnx::Engine& eng, Input& input, fnx::Vit* tower = nullptr)
+        : a(args), m(model), e(eng), in(input), vit(tower) {
         cache = std::make_shared<fnx::ConvCache>();
         cache->budget = (size_t) a.cache_mib << 20;
         slots.resize((size_t) a.batch);
@@ -949,7 +956,219 @@ struct Server {
             if (line.empty()) continue;
             const std::string cmd = line.substr(0, line.find(' '));
             if (cmd == "QUIT") return;
+            if (cmd == "PDUMP" || cmd == "PLOAD" || cmd == "PREAD" || cmd == "PDOFFER") {
+                // the prefill/decode hand-off's lines (the front drives them):
+                //   PDUMP <slot> <path>: the slot's conversation to the file -- tokens and every card's state bytes,
+                //                        with its K/V -- and off the lane; any same-build engine can load the file
+                //   PLOAD <slot> <path>: the file's conversation onto the slot's lane; a GEN whose prompt is the
+                //                        dumped tokens (or extends them) reuses all of it and only decodes
+                //   PREAD <ids>:         the prompt read onto a slot's lane (no generation); PDUMP then hands it off.
+                //   PDOFFER <ids> <path>: PREAD and the dump in one line -- no GEN can land on the lane between
+                //                        them (the read's K/V on the plain rotary, whatever this engine runs: a
+                //                        YaRN engine hands off to an unscaled one, so both read the same K/V).
+                //                        PREAD/PDUMP/PLOAD/PDOFFER answers carry their own prefix (as VENC's do),
+                //                        so no request's reader eats them among the T/DONE lines
+                int slot = -1;
+                std::string path;
+                {
+                    std::istringstream is(line);
+                    std::string c;
+                    is >> c;
+                    if (cmd == "PDUMP" || cmd == "PLOAD") is >> slot >> path;
+                }
+                if ((cmd == "PDUMP" || cmd == "PLOAD") && (slot < 0 || slot >= (int) slots.size() || path.empty())) {
+                    say("ERR " + cmd + ": expected " + cmd + " <slot> <path>");
+                    continue;
+                }
+                if (cmd != "PREAD" && cmd != "PDOFFER" && slots[(size_t) slot].decoding) {
+                    say("ERR " + cmd + ": slot " + std::to_string(slot) + " is decoding");
+                    continue;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                try {
+                    if (cmd == "PREAD" || cmd == "PDOFFER") {   // the ids after the command, comma-separated (as GEN's)
+                        const size_t sp1 = line.find(' ');
+                        const size_t sp2 = line.find(' ', sp1 + 1);
+                        std::string dpath;
+                        if (cmd == "PDOFFER") {
+                            if (sp2 == std::string::npos) throw std::runtime_error("expected PDOFFER <ids> <path>");
+                            dpath = line.substr(sp2 + 1);
+                            if (dpath.empty()) throw std::runtime_error("expected PDOFFER <ids> <path>");
+                        }
+                        const std::string ids_str = cmd == "PDOFFER" ? line.substr(sp1 + 1, sp2 - sp1 - 1)
+                                                                     : line.substr(sp1 + 1);
+                        std::vector<int> ids;
+                        for (const std::string& t : split_commas(ids_str)) {
+                            if (t.empty() || t.find_first_not_of("0123456789") != std::string::npos ||
+                                t.size() > 9)
+                                throw std::runtime_error("a token id '" + t + "' is not a whole number");
+                            ids.push_back(std::stoi(t));
+                        }
+                        if (ids.empty()) throw std::runtime_error("no ids");
+                        if ((long) ids.size() + 8 > a.max_ctx) throw std::runtime_error("the prompt exceeds the context");
+                        int pslot = best_slot(ids, 0);
+                        if (pslot < 0) throw std::runtime_error("every slot is decoding");
+                        fnx::Session& ps = lane_for(pslot);
+                        slots[(size_t) pslot].used = ++clock;
+                        const int need = pages_for((int) ids.size()) - e.lane_pages(slots[(size_t) pslot].lane);
+                        if (!make_room(need, pslot)) throw std::runtime_error("the K/V pool is full");
+                        fnx::GenStats st;
+                        reading = pslot;
+                        e.rope_std_next(true);   // PD: the hand-off's K/V on the plain rotary
+                        try { ps.read(ids, st, nullptr, fnx::ReadHints{}); }
+                        catch (...) { e.rope_std_next(false); throw; }   // never leave it on
+                        e.rope_std_next(false);
+                        reading = -1;
+                        if (cmd == "PDOFFER") {
+                            // the dump at once: no GEN can land on the lane between the read and the unload
+                            const std::shared_ptr<fnx::Engine::SeqState> dst = ps.unload();
+                            std::FILE* f = std::fopen(dpath.c_str(), "wb");
+                            if (!f) throw std::runtime_error("cannot write " + dpath + " (" + std::strerror(errno) + ")");
+                            bool ok = true;
+                            size_t total = 0;
+                            const unsigned hdr[4] = {0x58444E50u, 1u, (unsigned) fnx::NCARD, 2u};   // "PNDX", this format, cards, with K/V on the plain rotary
+                            ok = std::fwrite(hdr, sizeof(unsigned), 4, f) == 4;
+                            for (int c = 0; ok && c < fnx::NCARD; ++c) {
+                                const unsigned long long b = dst->bytes[(size_t) c];
+                                total += (size_t) b;
+                                ok = std::fwrite(&b, sizeof b, 1, f) == 1;
+                            }
+                            const unsigned n = (unsigned) dst->tokens.size();
+                            if (ok) ok = std::fwrite(&n, sizeof n, 1, f) == 1;
+                            if (ok && n) ok = std::fwrite(dst->tokens.data(), sizeof(int), n, f) == n;
+                            for (int c = 0; ok && c < fnx::NCARD; ++c)
+                                if (dst->bytes[(size_t) c])
+                                    ok = std::fwrite(dst->host[(size_t) c], 1, dst->bytes[(size_t) c], f) == dst->bytes[(size_t) c];
+                            const int werr = errno;
+                            if (std::fclose(f) != 0) ok = false;
+                            errno = werr;
+                            if (!ok) throw std::runtime_error("short write to " + dpath);
+                            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                            std::fprintf(stderr, "sfnx: PDOFFER slot %d: %d tokens (%d reused), %zu MiB to %s in %.0f ms\n",
+                                         pslot, st.prompt_tokens, st.reused, total >> 20, dpath.c_str(), ms);
+                            char buf[160];
+                            std::snprintf(buf, sizeof buf, "PDOFFER OK %d %d %d %zu", pslot, st.prompt_tokens, st.reused, total);
+                            say(buf);
+                        } else {
+                            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                            std::fprintf(stderr, "sfnx: PREAD slot %d: %d tokens (%d reused) in %.0f ms\n", pslot, st.prompt_tokens, st.reused, ms);
+                            char buf[96];
+                            std::snprintf(buf, sizeof buf, "PREAD OK %d %d %d %.0f", pslot, st.prompt_tokens, st.reused, ms);
+                            say(buf);
+                        }
+                    } else {
+                        fnx::Session& s = lane_for(slot);
+                        if (cmd == "PDUMP") {
+                        const std::shared_ptr<fnx::Engine::SeqState> st = s.unload();   // the state, the lane left empty
+                        std::FILE* f = std::fopen(path.c_str(), "wb");
+                        if (!f) throw std::runtime_error("cannot write " + path + " (" + std::strerror(errno) + ")");
+                        bool ok = true;
+                        size_t total = 0;
+                        const unsigned hdr[4] = {0x58444E50u, 1u, (unsigned) fnx::NCARD, 1u};   // "PNDX", this format, cards, with K/V
+                        ok = std::fwrite(hdr, sizeof(unsigned), 4, f) == 4;
+                        for (int c = 0; ok && c < fnx::NCARD; ++c) {
+                            const unsigned long long b = st->bytes[(size_t) c];
+                            total += (size_t) b;
+                            ok = std::fwrite(&b, sizeof b, 1, f) == 1;
+                        }
+                        const unsigned n = (unsigned) st->tokens.size();
+                        if (ok) ok = std::fwrite(&n, sizeof n, 1, f) == 1;
+                        if (ok && n) ok = std::fwrite(st->tokens.data(), sizeof(int), n, f) == n;
+                        for (int c = 0; ok && c < fnx::NCARD; ++c)
+                            if (st->bytes[(size_t) c])
+                                ok = std::fwrite(st->host[(size_t) c], 1, st->bytes[(size_t) c], f) == st->bytes[(size_t) c];
+                        const int werr = errno;
+                        if (std::fclose(f) != 0) ok = false;
+                        errno = werr;
+                        if (!ok) throw std::runtime_error("short write to " + path);
+                        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        std::fprintf(stderr, "sfnx: PDUMP slot %d: %u tokens, %zu MiB to %s in %.0f ms\n", slot, n, total >> 20,
+                                     path.c_str(), ms);
+                        char buf[160];
+                        std::snprintf(buf, sizeof buf, "PDUMP OK %u %zu", n, total);
+                        say(buf);
+                    } else {
+                        std::FILE* f = std::fopen(path.c_str(), "rb");
+                        if (!f) throw std::runtime_error("cannot read " + path + " (" + std::strerror(errno) + ")");
+                        std::string err;
+                        fnx::Engine::SeqState st;
+                        bool ok = true;
+                        unsigned hdr[4] = {};
+                        if (ok) ok = std::fread(hdr, sizeof(unsigned), 4, f) == 4;
+                        if (ok && hdr[0] != 0x58444E50u) { ok = false; err = path + ": not a PDUMP file"; }
+                        if (ok && hdr[1] != 1u) { ok = false; err = path + ": a PDUMP format this engine does not read"; }
+                        if (ok && hdr[2] != (unsigned) fnx::NCARD)
+                            { ok = false; err = path + ": dumped on " + std::to_string(hdr[2]) + " cards, this engine runs " + std::to_string(fnx::NCARD); }
+                        if (ok && hdr[3] != 1u && hdr[3] != 2u) { ok = false; err = path + ": dumped without K/V"; }
+                        if (ok && hdr[3] == 2u && e.rope_scaled())
+                            { ok = false; err = path + ": dumped on the plain rotary, this engine runs YaRN"; }
+                        st.kv = true;
+                        st.host.assign(fnx::NCARD, nullptr);
+                        st.bytes.assign(fnx::NCARD, 0);
+                        for (int c = 0; ok && c < fnx::NCARD; ++c) {
+                            unsigned long long b = 0;
+                            if (std::fread(&b, sizeof b, 1, f) != 1) { ok = false; err = path + ": shorter than its header says"; break; }
+                            st.bytes[(size_t) c] = (size_t) b;
+                        }
+                        unsigned n = 0;
+                        if (ok && std::fread(&n, sizeof n, 1, f) != 1) { ok = false; err = path + ": shorter than its header says"; }
+                        if (ok) {
+                            st.tokens.resize(n);
+                            if (n && std::fread(st.tokens.data(), sizeof(int), n, f) != n) { ok = false; err = path + ": shorter than its header says"; }
+                        }
+                        for (int c = 0; ok && c < fnx::NCARD; ++c) {
+                            const size_t b = st.bytes[(size_t) c];
+                            if (!b) continue;
+                            st.host[(size_t) c] = std::aligned_alloc(4096, (b + 4095) / 4096 * 4096);
+                            if (!st.host[(size_t) c] || std::fread(st.host[(size_t) c], 1, b, f) != b)
+                                { ok = false; err = path + ": shorter than its header says"; }
+                        }
+                        if (ok && std::fgetc(f) != EOF) { ok = false; err = path + ": longer than its header says"; }
+                        std::fclose(f);
+                        if (!ok) throw std::runtime_error(err);
+                        s.park();      // whatever the lane held goes to the conversation cache; the dump takes the lane
+                        s.reload_dump(st);   // reload + a checkpoint at the dump's end (its bytes carry none of their own)
+                        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        std::fprintf(stderr, "sfnx: PLOAD slot %d: %u tokens in %.0f ms\n", slot, n, ms);
+                        char buf[96];
+                        std::snprintf(buf, sizeof buf, "PLOAD OK %u", n);
+                        say(buf);
+                    }
+                    }
+                } catch (const std::exception& ex) {
+                    say(cmd + " ERR " + ex.what());
+                }
+                continue;
+            }
             if (cmd != "GEN" && cmd != "BGEN" && cmd != "GENI" && cmd != "BGENI") {
+                // ENC <image> <out>: the front's picture path, run on the tower this engine holds (the same process,
+                // the same cards). The answer the front's Vision class reads: "VENC OK <n> <nx> <ny> <ms>" (the sfnx-vision
+                // line with a VENC prefix: with batch slots decoding, other threads write T/DONE lines on stdout, so a bare
+                // OK/ERR would be eaten by a request's reader). The embeddings file is the SVE1 the GENI line then names.
+                if (cmd == "ENC") {
+                    if (!vit) {
+                        say("VENC ERR this engine was started without --vision-model");
+                        continue;
+                    }
+                    const size_t sp = line.find(' ');
+                    const size_t sp2 = line.rfind(' ');
+                    if (sp == std::string::npos || sp2 == sp) {
+                        say("VENC ERR expected: ENC <image> <output>");
+                        continue;
+                    }
+                    const std::string img = line.substr(sp + 1, sp2 - sp - 1), out = line.substr(sp2 + 1);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    try {
+                        const std::vector<fnx::Vit::Grid> gs = vit->encode_file({img}, out);
+                        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        char buf[128];
+                        std::snprintf(buf, sizeof buf, "VENC OK %d %d %d %.0f", gs[0].n, gs[0].nx, gs[0].ny, ms);
+                        say(buf);
+                    } catch (const std::exception& ex) {
+                        say(std::string("VENC ERR ") + ex.what());
+                    }
+                    continue;
+                }
                 say("ERR " + cmd + ": not supported by sfnx");
                 continue;
             }
@@ -997,17 +1216,6 @@ void check_test_prompt() {
     std::fprintf(stderr, "sfnx: SFNX_TEST_PROMPT: every text request reads %s instead of its own tokens\n", tp);
 }
 
-// the engine state after a failure part way is unknown: say why and _exit at once (the front end starts it again). No
-// destructors: freeing the conversation cache's pinned memory takes minutes, and the stdin reader thread keeps the
-// process up, while the front end waits for the ERR line or EOF
-[[noreturn]] void fail(const std::exception& ex) {
-    say(std::string("ERR ") + ex.what());
-    std::fprintf(stderr, "sfnx: failed: %s\n", ex.what());
-    std::fflush(stdout);
-    std::fflush(stderr);
-    std::_Exit(1);
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1021,33 +1229,35 @@ int main(int argc, char** argv) {
         return 2;
     }
     const auto t_load = std::chrono::steady_clock::now();
-    // made in place and failed like the rest, so a card or link refused at load ends with its reason too
-    std::optional<fnx::Model> m;
-    std::optional<fnx::Mtp> mtp;
-    std::optional<fnx::Engine> e;
-    try {
-        m.emplace(a.gguf.c_str());
-        mtp.emplace(*m, a.mtp_dir, a.draft_vocab);
-        e.emplace(*m, a.max_ctx, a.batch);
-        e->mtp_attach(*mtp);
-    } catch (const std::exception& ex) {
-        fail(ex);
-    }
+    fnx::Model m(a.gguf.c_str());
+    const fnx::Mtp mtp(m, a.mtp_dir, a.draft_vocab);
+    fnx::Engine e(m, a.max_ctx, a.batch);
+    e.mtp_attach(mtp);
+    // the tower (a.vision_model): after the engine, so its buffers take what the engine left, and before the
+    // requests, so the first picture finds it up (its VRAM is a one-off ~0.5 GB a card at the 1024-token default)
+    std::unique_ptr<fnx::Vit> vit;
+    if (!a.vision_model.empty()) vit = std::make_unique<fnx::Vit>(m, a.vision_model, a.vision_max_tokens);
     Input in;
+    // the engine state after a failure part way is unknown: say why and _exit at once (the front end starts it
+    // again). No destructors: freeing the conversation cache's pinned memory takes minutes, and the stdin reader
+    // thread keeps the process up, while the front end waits for the ERR line or EOF
+    auto fail = [](const std::exception& ex) {
+        say(std::string("ERR ") + ex.what());
+        std::fprintf(stderr, "sfnx: failed: %s\n", ex.what());
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(1);
+    };
     try {
-        Server srv(a, *m, *e, in);
+        Server srv(a, m, e, in, vit.get());
         std::string vfree;   // each card's, "a / b / c"
-        for (const long v : e->free_vram_mib()) vfree += (vfree.empty() ? "" : " / ") + std::to_string(v);
+        for (const long v : e.free_vram_mib()) vfree += (vfree.empty() ? "" : " / ") + std::to_string(v);
         std::fprintf(stderr,
                      "sfnx: loaded in %.1f s, context %d, MTP K=%d, lookup %d, %d slot(s); %d cards, sums between them %s; K/V pool "
                      "(%s) %d positions free; VRAM free %s MiB\n",
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count(), a.max_ctx, a.K, a.lookup, a.batch,
                      fnx::NCARD, fnx::ring_f32() ? "fp32" : "fp16",
-#if FNX_27B
-                     "f16", e->free_pages() * fnx::S27_PP, vfree.c_str());
-#else
-                     fnx::kv_q8() ? "int8" : "f16", e->free_pages() * fnx::KVP_POS, vfree.c_str());
-#endif
+                     fnx::kv_q8() ? "int8" : "f16", e.free_pages() * fnx::KVP_POS, vfree.c_str());
         if (fnx::NCARD > 3)
             std::fprintf(stderr, "sfnx: %d cards builds and passes the CPU checks but has not been validated on hardware "
                                  "(docs/verification.md, \"Other card counts\")\n", fnx::NCARD);

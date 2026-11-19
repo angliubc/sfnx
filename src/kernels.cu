@@ -437,11 +437,7 @@ __global__ void k_gdn_out_norm(const float* o, const float* z, const float* w, f
     __shared__ float sh[32];
     const float v = o[at];
     const float ms = block_sum(v * v, sh) / (float) HS;
-#if FNX_27B   // the 27B gates with silu(z), Flash-Next with sigmoid(z)
-    y[at] = v * rsqrtf(ms + eps) * w[i] * z[at] * sigm(z[at]);
-#else
     y[at] = v * rsqrtf(ms + eps) * w[i] * sigm(z[at]);
-#endif
 }
 
 #include "gdn_core.cuh"
@@ -756,6 +752,7 @@ __global__ void k_ple_conv(float* R, const float* gated, const float* normd, con
 constexpr int RCH = N / NCARD + 1;     // words per slot row (more than a chunk's pairs)
 constexpr int RSTEPS = NCARD - 1;      // receive slots: the reduce hops
 constexpr int NP = N / 2;          // pairs per row
+constexpr float RING_MAX = 65504.0f;   // fp16's largest finite value
 // fp32 words: one value | tag per word, pair i at words 2i, 2i + 1
 __device__ __forceinline__ void rput32(unsigned long long* p, float2 v, unsigned tag, unsigned* err) {
     if (!(isfinite(v.x) && isfinite(v.y))) atomicOr(err, 2u);
@@ -1016,43 +1013,8 @@ int hc1_rows() {
     return rows;
 }
 
-int hc_blocks() { return H_BLOCKS; }
-
-// the read's grid on each card (0: hc_prepare not run there)
-constexpr int HC_MAXDEV = 64;
-int hc_grid_[HC_MAXDEV] = {};
-
-int hc_dev() {
-    int dev = -1;
-    const cudaError_t e = cudaGetDevice(&dev);
-    if (e != cudaSuccess) throw std::runtime_error(std::string("hc: cudaGetDevice: ") + cudaGetErrorString(e));
-    if (dev < 0 || dev >= HC_MAXDEV) throw std::runtime_error("hc: card " + std::to_string(dev) + " past the " + std::to_string(HC_MAXDEV) + " it tracks");
-    return dev;
-}
-
-int hc_grid() {
-    const int dev = hc_dev();
-    if (!hc_grid_[dev]) throw std::runtime_error("hc_read: hc_prepare was not run on card " + std::to_string(dev));
-    return hc_grid_[dev];
-}
-
-int hc_prepare(float* scratch, int cap) {
-    const int dev = hc_dev();
-    int sms = 0;
-    const cudaError_t e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    if (e != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: SM count: ") + cudaGetErrorString(e));
-    if (sms <= 0) throw std::runtime_error("hc_prepare: card " + std::to_string(dev) + " reports " + std::to_string(sms) + " SMs");
-    if (cap < 0 || cap > H_BLOCKS) throw std::runtime_error("hc_prepare: cap 1.." + std::to_string(H_BLOCKS) + " (0: none), got " + std::to_string(cap));
-    hc_grid_[dev] = std::min(sms, cap ? cap : H_BLOCKS);
-    // a counter left by another grid sits mid-generation for this one: its next barrier would let blocks through early
-    const unsigned zero = 0;
-    const cudaError_t z = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &zero, sizeof zero, cudaMemcpyHostToDevice);
-    if (z != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: the barrier counter: ") + cudaGetErrorString(z));
-    return hc_grid_[dev];
-}
-
 void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
-             const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err, int T, void* st,
+             const float* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err, int T, void* st,
              void* q8) {
     HcArgs a{R, bo, inj_prev, w_norm, w_down, w_up, w_inj, eps, mixed, inject, nullptr, nullptr, nullptr, nullptr, nullptr, err,
              (block_q8_1*) q8};
@@ -1065,34 +1027,32 @@ void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_no
     if (q8) twin_of(q8, N, a.tq, a.td);
     cudaStream_t s = (cudaStream_t) st;
     const bool one = T <= hc1_rows();
-    const int grid = hc_grid();
     switch (T) {
-        case 1: hc_launch<1>(a, s, one, grid); break;
-        case 2: hc_launch<2>(a, s, one, grid); break;
-        case 3: hc_launch<3>(a, s, one, grid); break;
-        case 4: hc_launch<4>(a, s, one, grid); break;
-        case 5: hc_launch<5>(a, s, one, grid); break;
-        case 6: hc_launch<6>(a, s, one, grid); break;
-        case 7: hc_launch<7>(a, s, one, grid); break;
-        case 8: hc_launch<8>(a, s, one, grid); break;
-        case 9: hc_launch<9>(a, s, one, grid); break;
-        case 10: hc_launch<10>(a, s, one, grid); break;
-        case 11: hc_launch<11>(a, s, one, grid); break;
-        case 12: hc_launch<12>(a, s, one, grid); break;
-        case 13: hc_launch<13>(a, s, one, grid); break;
-        case 14: hc_launch<14>(a, s, one, grid); break;
-        case 15: hc_launch<15>(a, s, one, grid); break;
-        case 16: hc_launch<16>(a, s, one, grid); break;
+        case 1: hc_launch<1>(a, s, one); break;
+        case 2: hc_launch<2>(a, s, one); break;
+        case 3: hc_launch<3>(a, s, one); break;
+        case 4: hc_launch<4>(a, s, one); break;
+        case 5: hc_launch<5>(a, s, one); break;
+        case 6: hc_launch<6>(a, s, one); break;
+        case 7: hc_launch<7>(a, s, one); break;
+        case 8: hc_launch<8>(a, s, one); break;
+        case 9: hc_launch<9>(a, s, one); break;
+        case 10: hc_launch<10>(a, s, one); break;
+        case 11: hc_launch<11>(a, s, one); break;
+        case 12: hc_launch<12>(a, s, one); break;
+        case 13: hc_launch<13>(a, s, one); break;
+        case 14: hc_launch<14>(a, s, one); break;
+        case 15: hc_launch<15>(a, s, one); break;
+        case 16: hc_launch<16>(a, s, one); break;
         default: throw std::runtime_error("hc_read: T out of range");
     }
     ck_launch("hc_read");
 }
 
 void hc_preset_barrier(float* scratch, unsigned barriers_left) {
-    const unsigned g = (unsigned) hc_grid(), mod = hc_bar_mod(g);
-    if (barriers_left == 0 || barriers_left > mod / g)
-        throw std::runtime_error("hc_preset_barrier: barriers_left must be 1.." + std::to_string(mod / g));
-    const unsigned v = mod - barriers_left * g;
+    if (barriers_left == 0 || barriers_left > H_BAR_MOD / H_BLOCKS)
+        throw std::runtime_error("hc_preset_barrier: barriers_left must be 1.." + std::to_string(H_BAR_MOD / H_BLOCKS));
+    const unsigned v = H_BAR_MOD - barriers_left * (unsigned) H_BLOCKS;
     const cudaError_t e = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &v, sizeof v, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) throw std::runtime_error(std::string("hc_preset_barrier: ") + cudaGetErrorString(e));
 }
@@ -2072,15 +2032,7 @@ void q8s_run(const Q8Segs& g, int rows, int cols, const void* y, int T, void* st
         if (rows < 8192) throw std::runtime_error("q8s_gemv_segs: compiled for 8192 rows or more (q, k and v)");
         q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
     } else {
-#if FNX_27B
-        // up to 4 rows by the window (the 27B's windows, bin/s27_run S27_BENCH=1: 1 row 19.4 -> 18.3 ms, 4 rows
-        // 24.5 -> 22.3), past that by the matrix (5 to 16 rows: choosing by the window was no faster)
-        if (T <= 2) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
-        else if (T <= 4) q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
-        else if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
-#else
         if (rows >= 8192) q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
-#endif
         else if (rows >= 4096) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
         else q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
     }
@@ -2155,16 +2107,9 @@ void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, c
     for (int s = 0; s < Q8S_SEGS; ++s) g.q[s] = w.q, g.d[s] = w.d, g.out[s] = out, g.end[s] = rows, g.stride[s] = rows;
     const block_q8_1* yq = (const block_q8_1*) y;
     cudaStream_t s = (cudaStream_t) st;
-    // compiled for its one use, qkvz, as q8s_gemv alone would run them: 4096 to 8191 rows two a warp; the 27B's 8192
-    // and more (on two cards) four
-#if FNX_27B
-    if (rows < 4096) throw std::runtime_error("q8s_gemv_f32: compiled for 4096 rows or more (qkvz)");
-    if (rows >= 8192) q8s_ab_launch<4>(g, rows, cols, yq, W, x, yf, rf, T, s);
-    else q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
-#else
+    // compiled for its one use, qkvz (4096 to 8191 rows: two a warp, as q8s_gemv alone would run them)
     if (rows < 4096 || rows >= 8192) throw std::runtime_error("q8s_gemv_f32: compiled for 4096..8191 rows (qkvz)");
     q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
-#endif
     ck_launch("q8s_gemv_f32");
 }
 #endif

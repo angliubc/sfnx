@@ -7,7 +7,6 @@
 // What the chunk leaves is the state a run of windows over the same rows leaves: K/V, recurrent states and
 // histories, the PLE history, the QSA keys, and with the draft layer attached its K/V and QSA keys too (the draft layer
 // over the chunk's final residuals in windows of MAXT rows).
-#include "pf_common.cuh"
 #include "engine.hpp"
 #include "engine_impl.hpp"
 #include "env.hpp"
@@ -24,8 +23,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
-#include <future>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -39,6 +36,12 @@ namespace {
 
 constexpr size_t PF_WH = (size_t) 16 << 20;                      // halves: a dense matrix's f16 staging (larger ones go in slices)
 
+void ckc(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) throw std::runtime_error(std::string("prefill: ") + what + ": " + cudaGetErrorString(e));
+}
+void ckb(cublasStatus_t s, const char* what) {
+    if (s != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string("prefill: cublas ") + what + ": " + std::to_string((int) s));
+}
 // buffers carved from a block (aligned to 256 bytes); with base null it only sums the sizes
 struct Arena {
     char* base;
@@ -52,6 +55,26 @@ struct Arena {
         return p;
     }
 };
+
+size_t pf_card_bytes = 0;   // the prompt path's allocations on the card being set up
+template <typename T> T* palloc(size_t n) {
+    void* p = nullptr;
+    const cudaError_t e = cudaMalloc(&p, n * sizeof(T));
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        int dev = -1;
+        cudaGetDevice(&dev);
+        throw std::runtime_error("prefill: cudaMalloc of " + std::to_string(n * sizeof(T) >> 20) + " MiB on card " + std::to_string(dev) +
+                                 ": " + cudaGetErrorString(e) + " (" + std::to_string(fr >> 20) + " MiB free; the prompt path holds " +
+                                 std::to_string(pf_card_bytes >> 20) + " MiB there already)");
+    }
+    pf_card_bytes += n * sizeof(T);
+    ckc(cudaMemset(p, 0, n * sizeof(T)), "cudaMemset");
+    own_dev(p);
+    return (T*) p;
+}
 
 __device__ __forceinline__ float pf_sigm(float x) { return 1.0f / (1.0f + __expf(-x)); }
 __device__ __forceinline__ float pf_silu(float x) { return x / (1.0f + __expf(-x)); }
@@ -78,6 +101,14 @@ __device__ float pf_block_sum(float v, float* sh) {
 }
 
 // ---------------------------------------------------------------- conversions
+// the split Q8_0 layout (int8 rows, f16 scale per 32) to f16, d * q as ggml's dequantization to f16 rounds it
+__global__ void k_q8s_f16(const int8_t* __restrict__ q, const uint16_t* __restrict__ d, size_t n, __half* __restrict__ out) {
+    for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < n; e += (size_t) gridDim.x * blockDim.x)
+        out[e] = __float2half(__half2float(__ushort_as_half(d[e / 32])) * (float) q[e]);
+}
+__global__ void k_f32_f16(const float* __restrict__ x, size_t n, __half* __restrict__ y) {
+    for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < n; e += (size_t) gridDim.x * blockDim.x) y[e] = __float2half(x[e]);
+}
 __global__ void k_f16_f32(const __half* __restrict__ x, int rows, int cols, float* __restrict__ y, int ldy) {
     for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < (size_t) rows * cols; e += (size_t) gridDim.x * blockDim.x)
         y[(e / cols) * ldy + e % cols] = __half2float(x[e]);
@@ -95,7 +126,7 @@ constexpr int HCB_THREADS = 256, HCB_PER = N / HCB_THREADS;
 static_assert(N % HCB_THREADS == 0, "stream elements per thread");
 __global__ void __launch_bounds__(HCB_THREADS) k_hcb_prep(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
                                                           const float* __restrict__ wn, float* __restrict__ rs, __half* __restrict__ xh,
-                                                          float eps, const uint16_t* __restrict__ w_inj, float* __restrict__ inject_out) {
+                                                          float eps, const float* __restrict__ w_inj, float* __restrict__ inject_out) {
     const int t = blockIdx.x, i0 = threadIdx.x;
     __shared__ float sh[32];
     __shared__ float shi[HC][HCB_THREADS / 32];
@@ -124,7 +155,7 @@ __global__ void __launch_bounds__(HCB_THREADS) k_hcb_prep(float* __restrict__ R,
             xh[(size_t) t * D + c * N + i] = __float2half(xn);
             if (w_inj)
 #pragma unroll
-                for (int r = 0; r < HC; ++r) acc[r] = fmaf(__uint_as_float((unsigned) w_inj[(size_t) r * D + c * N + i] << 16), xn, acc[r]);
+                for (int r = 0; r < HC; ++r) acc[r] = fmaf(w_inj[(size_t) r * D + c * N + i], xn, acc[r]);
         }
     }
     if (!w_inj) return;
@@ -153,7 +184,7 @@ constexpr int HCM_THREADS = 512, HCM_WPR = HCM_THREADS / 32 / HC;   // warps per
 __global__ void __launch_bounds__(HCM_THREADS) k_hcb_mixinj(const float* __restrict__ R, const float* __restrict__ wn,
                                                             const float* __restrict__ rs, const float* __restrict__ up,
                                                             float* __restrict__ mixed, __half* __restrict__ mixh,
-                                                            const uint16_t* __restrict__ w_inj,
+                                                            const float* __restrict__ w_inj,
                                                             float* __restrict__ inj) {
     const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const float* Rt = R + (size_t) t * D;
@@ -174,7 +205,7 @@ __global__ void __launch_bounds__(HCM_THREADS) k_hcb_mixinj(const float* __restr
     constexpr int QLEN = D / HCM_WPR;
     float acc = 0.f;
     for (int i = q * QLEN + lane; i < (q + 1) * QLEN; i += 32)
-        acc += __uint_as_float((unsigned) w_inj[(size_t) r * D + i] << 16) * (Rt[i] * wn[i] * r_s[i / N]);
+        acc += w_inj[(size_t) r * D + i] * (Rt[i] * wn[i] * r_s[i / N]);
     acc = pf_wsum(acc);
     if (lane == 0) part[r][q] = acc;
     __syncthreads();
@@ -285,6 +316,8 @@ __global__ void k_pf_swiglu(const float* __restrict__ gu, int ffs, int C, __half
         h[e] = __float2half(pf_silu(gu[(size_t) t * 2 * ffs + i]) * gu[(size_t) t * 2 * ffs + ffs + i]);
     }
 }
+
+unsigned grid_for(size_t n) { return (unsigned) std::min<size_t>(4096, (n + 255) / 256); }
 
 }  // namespace
 
@@ -427,7 +460,7 @@ void pf_sgemm(Engine::Pf& p, const float* W, int rows, int cols, const float* x,
 }
 // the hyper-connection read for C rows (see hc.cuh for what it computes)
 void pf_hc_read(Engine::Pf& p, float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
-                const uint16_t* w_inj, float eps, float* mixed, float* inject, int C, cudaStream_t s) {
+                const float* w_inj, float eps, float* mixed, float* inject, int C, cudaStream_t s) {
     k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);   // the inject rows here
     k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
     pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
@@ -483,14 +516,89 @@ __global__ void k_pfr_addend(float* __restrict__ x, const float* __restrict__ pa
         x[e] = fmaf(pf_sigm(logits[(size_t) t * (NEXP + 1) + NEXP]), part[((size_t) C * TOPK + t) * N + i], s);
     }
 }
+// out = f16(x) over n values (n even)
+__global__ void k_pfr_pack(const float2* __restrict__ x, int n2, __half2* __restrict__ out, unsigned* err) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
+        const float2 v = x[e];
+        if (!(fabsf(v.x) <= 65504.0f && fabsf(v.y) <= 65504.0f)) atomicOr(err, 2u);   // past fp16's range (or NaN)
+        out[e] = __floats2half2_rn(v.x, v.y);
+    }
+}
+// out = f16(in + x) over n values (n even)
+__global__ void k_pfr_add(const __half2* __restrict__ in, const float2* __restrict__ x, int n2, __half2* __restrict__ out,
+                          unsigned* err) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
+        const float2 a = __half22float2(in[e]), b = x[e];
+        const float2 v = make_float2(a.x + b.x, a.y + b.y);
+        if (!(fabsf(v.x) <= 65504.0f && fabsf(v.y) <= 65504.0f)) atomicOr(err, 2u);
+        out[e] = __floats2half2_rn(v.x, v.y);
+    }
+}
+__global__ void k_pfr_out(const __half2* __restrict__ ag, float2* __restrict__ x, int n2) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) x[e] = __half22float2(ag[e]);
+}
 
+void cud(CUresult e, const char* what) {
+    if (e != CUDA_SUCCESS) {
+        const char* s = nullptr;
+        cuGetErrorString(e, &s);
+        throw std::runtime_error(std::string("prefill: ") + what + ": " + (s ? s : "?"));
+    }
+}
+
+// one direction's sum of x (C rows of N) over the cards, on stream s; this card is at position g of the direction's
+// ring (its next card: g + 1 there), by the steps of r.plan (pf_ring_plan.hpp, which describes the algorithm). Each
+// copy into the next card is followed by a flag there; the step after waits on this card's flag (stream memory
+// operations: no SM time, no host)
+constexpr int PF_RING_STEPS = pf_ring_steps(NCARD);   // flags a set holds
+void pf_ring_dir(Engine::PfRing& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s) {
+    if (r.plan.empty() || r.plan.front().part != g) throw std::runtime_error("prefill: the ring's plan is not card " + std::to_string(g) + "'s");
+    const int set = (int) (seq & 1u);
+    auto r0 = [&](int k) { return k * C / NCARD; };
+    auto rows = [&](int k) { return r0(k + 1) - r0(k); };
+    CUstream cs = (CUstream) s;
+    auto signal = [&](int step) {
+        cud(cuStreamWriteValue32(cs, (CUdeviceptr) (r.nflags + set * PF_RING_STEPS + step), seq, 0), "ring flag");
+    };
+    auto wait = [&](int step) {
+        cud(cuStreamWaitValue32(cs, (CUdeviceptr) (r.flags + set * PF_RING_STEPS + step), seq, CU_STREAM_WAIT_VALUE_GEQ), "ring wait");
+    };
+    auto copy = [&](__half* dst, const __half* src, int nrows) {
+        ckc(cudaMemcpyPeerAsync(dst, r.next_dev, src, dev, (size_t) nrows * N * sizeof(__half), s), "ring copy");
+    };
+    // a part can be empty (a chunk of fewer rows than cards: a read cut at a checkpoint): its kernels are skipped, its
+    // copies move nothing, its flags still step
+    auto add = [&](const __half* in, int part, __half* out) {
+        if (rows(part) == 0) return;
+        k_pfr_add<<<grid_for((size_t) rows(part) * N / 2), 256, 0, s>>>((const __half2*) in, (const float2*) (x + (size_t) r0(part) * N),
+                                                                       rows(part) * N / 2, (__half2*) out, err);
+    };
+    for (const PfRingOp& o : r.plan) {
+        switch (o.k) {
+            case PfRingOp::PACK:
+                if (rows(o.part) > 0)
+                    k_pfr_pack<<<grid_for((size_t) rows(o.part) * N / 2), 256, 0, s>>>((const float2*) (x + (size_t) r0(o.part) * N),
+                                                                                       rows(o.part) * N / 2, (__half2*) r.send, err);
+                break;
+            case PfRingOp::ADD: add(r.in[o.hop][set], o.part, o.fin ? r.ag[set] + (size_t) r0(o.part) * N : r.send); break;
+            case PfRingOp::SEND: copy(r.nin[o.hop][set], r.send, rows(o.part)); break;
+            case PfRingOp::PASS: copy(r.nag[set] + (size_t) r0(o.part) * N, r.ag[set] + (size_t) r0(o.part) * N, rows(o.part)); break;
+            case PfRingOp::SIGNAL: signal(o.step); break;
+            case PfRingOp::WAIT: wait(o.step); break;
+            case PfRingOp::OUT:
+                k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const __half2*) r.ag[set], (float2*) x, C * N / 2);
+                break;
+            default: throw std::runtime_error("prefill: a ring step of unknown kind " + std::to_string((int) o.k));
+        }
+    }
+}
 
 // the sum of x (C rows of N) over the cards on card g, one way round (each card's link is busy both ways already: it
 // sends to g + 1 while it takes from g - 1; measured, the other direction at once halves both)
 void pf_ring(Engine::Pf& p, int g, float* x, int C, const RingMoe* m, unsigned* err, cudaStream_t s) {
     const unsigned seq = ++p.seq;
     if (m) k_pfr_addend<<<grid_for((size_t) C * N), 256, 0, s>>>(x, m->part, m->topw, m->logits, C);
-    pf_ring_run(p.ring_ce, p.dev, g, x, C, seq, err, s);
+    pf_ring_dir(p.ring_ce, p.dev, g, x, C, seq, err, s);
     ckc(cudaGetLastError(), "ring");
 }
 
@@ -576,8 +684,8 @@ void Engine::prefill_alloc() {
         {
             const int d = current_card();
             cublasHandle_t h = p->blas;
-            own([d, h] { cudaSetDevice(d); cublasDestroy(h); });
-            own([p] { delete p; });
+            owned().push_back([d, h] { cudaSetDevice(d); cublasDestroy(h); });
+            owned().push_back([p] { delete p; });
         }
         ckb(cublasSetStream(p->blas, b.st), "stream");
         ckb(cublasSetMathMode(p->blas, CUBLAS_TENSOR_OP_MATH), "math mode");
@@ -662,7 +770,7 @@ void Engine::prefill_alloc() {
             p->xq = palloc<uint8_t>((size_t) pf_c_ * q8_1_bytes(N));
             q8_twin(p->xq, (size_t) pf_c_ * q8_1_bytes(N), palloc<int8_t>((size_t) pf_c_ * N), palloc<float>((size_t) pf_c_ * N / 32));
             const void* q = p->xq;
-            own([q] { q8_untwin(q); });
+            owned().push_back([q] { q8_untwin(q); });
         }
         p->logits = palloc<float>((size_t) pf_c_ * (NEXP + 1));
         p->topw = palloc<float>((size_t) pf_c_ * TOPK);
@@ -856,10 +964,10 @@ void Engine::prefill_draft(int C, int set) {
         } else {
             pf_dense(p, L.idx_qk.s, qsa_rows(), N, p.mixed, C, p.yidx, qsa_rows(), s);
         }
-        qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.mtp_qsa_ring, b.mtp_qsa_pooled, b.pg, p.qidx, p.ctl, C, eps, rope_of(b.mrope), s);
+        qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.mtp_qsa_ring, b.mtp_qsa_pooled, b.pg, p.qidx, p.ctl, C, eps, rope_cur(b.mrope), s);
         pf_dense(p, L.wk.s, NKVH * HD, N, p.mixed, C, p.k, NKVH * HD, s);
         pf_dense(p, L.wv.s, NKVH * HD, N, p.mixed, C, p.v, NKVH * HD, s);
-        attn_prep(nullptr, p.k, L.q_norm, L.k_norm, 0, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
+        attn_prep(nullptr, p.k, L.q_norm, L.k_norm, 0, NKVH, p.ctl, C, eps, rope_cur(b.mrope), s);
         kv_append(p.k, p.v, b.mtp_kc, b.mtp_vc, b.pg, b.att_ring.card, C, p.ctl, s);
         ckc(cudaGetLastError(), "draft layer (prompt)");
     }
@@ -892,14 +1000,9 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
     const int h0 = (int) history_.size();
     const auto tok_at = [&](int q) -> int { return q < h0 ? history_[q] : tokens[q - h0]; };
     const size_t nt = tokens.size(), per = (size_t) K * pf_c_;
-    // FNX_NGRAM=disk: the first pass's rows are read before anything runs to hide them (~1.6 s for 16,384 rows on this
-    // box's NVMe), so the passes start at one chunk and double: a pass hides the next one's reads while those take less
-    // than its GPU time (~0.1 ms of reads against ~0.26 ms a row), and a one-chunk pass followed by a whole one did not
-    // (2.0 s for the one chunk's 1.06)
-    const size_t first = m_.ple_rows->mode() == PleRows::Mode::DISK ? std::min(per, (size_t) pf_c_) : per;
-    auto chunks_of = [&](size_t i0, int half, size_t span) {
+    auto chunks_of = [&](size_t i0, int half) {
         std::vector<PfChunk> ch;
-        for (size_t i = i0; i < std::min(nt, i0 + span); i += pf_c_) {
+        for (size_t i = i0; i < std::min(nt, i0 + per); i += pf_c_) {
             const size_t e = std::min(nt, i + pf_c_);
             ch.push_back({std::vector<int>(tokens.begin() + i, tokens.begin() + e), e < nt ? tokens[e] : after, half * K + (int) ch.size()});
         }
@@ -912,12 +1015,11 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
             i += c.tokens.size();
         }
     };
-    std::vector<PfChunk> ch = chunks_of(0, 0, first);
+    std::vector<PfChunk> ch = chunks_of(0, 0);
     embed(0, ch);
-    for (size_t i = 0, k = 0, span = first, grown = 0; i < nt; i += span, span = grown, ++k) {
-        grown = std::min(per, 2 * span);
-        std::vector<PfChunk> next = chunks_of(i + span, (int) ((k + 1) & 1), grown);
-        prefill_pass(ch, staging, [&] { embed(i + span, next); });
+    for (size_t i = 0, k = 0; i < nt; i += per, ++k) {
+        std::vector<PfChunk> next = chunks_of(i + per, (int) ((k + 1) & 1));
+        prefill_pass(ch, staging, [&] { embed(i + per, next); });
         size_t e = i;
         for (const PfChunk& c : ch) {
             e += c.tokens.size();
@@ -935,11 +1037,6 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     for (int j = 0; j < nk; ++j) pos0[(size_t) j] = pos_ + rows, rows += (int) chunks[(size_t) j].tokens.size();
     if (pos_ + rows > max_ctx_) throw Refused("prefill: context full");
     ensure_pages(pos_ + rows);
-    // the next pass's rows on a thread of their own from here: enqueueing this pass keeps this one busy for ~70% of the
-    // pass (3.8 of 5.5 s for 16,384 rows), and FNX_NGRAM=disk's reads (~1.7 s for those rows on this box's NVMe) after it
-    // went unhidden: a cold 62,793-token read 23.1 s against 17.1 s with every row cached. It writes only the other
-    // half's buffers and reads what this pass leaves alone (the tokens, history_ until the pass ends)
-    std::future<void> next_rows = std::async(std::launch::async, between);
     const float eps = m_.eps;
     // each chunk's (position, tag) and each group's: a tag per group, so the recurrent history's parity steps per group
     for (int j = 0; j < nk; ++j) {
@@ -1090,13 +1187,13 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                     pf_dense(p, L.wq.s, NQH * 2 * HD, N, p.mixed, C, p.qg, NQH * 2 * HD, s);
                     pf_dense_xh(p, L.wk.s, NKVH * HD, N, C, p.k, NKVH * HD, s);
                     pf_dense_xh(p, L.wv.s, NKVH * HD, N, C, p.v, NKVH * HD, s);
-                    attn_prep(p.qg, p.k, L.q_norm, L.k_norm, NQH, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
+                    attn_prep(p.qg, p.k, L.q_norm, L.k_norm, NQH, NKVH, p.ctl, C, eps, rope_cur(b.mrope), s);
                     kv_append(p.k, p.v, b.kc[l], b.vc[l], b.pg, b.att_ring.card, C, p.ctl, s);
                     // the indexer: bf16 projections as f32 (llama.cpp's choice past 8 rows on a V100)
                     k_bf16_f32<<<grid_for((size_t) 512 * N), 256, 0, s>>>(L.idx_wq, (size_t) 512 * N, p.widx);
                     k_bf16_f32<<<grid_for((size_t) 128 * N), 256, 0, s>>>(L.idx_wk, (size_t) 128 * N, p.widx + (size_t) 512 * N);
                     pf_sgemm(p, p.widx, qsa_rows(), N, p.mixed, C, p.yidx, qsa_rows());
-                    qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.qsa_ring[l], b.qsa_pooled[l], b.pg, p.qidx, p.ctl, C, eps, rope_of(b.mrope), s);
+                    qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.qsa_ring[l], b.qsa_pooled[l], b.pg, p.qidx, p.ctl, C, eps, rope_cur(b.mrope), s);
                     // groups of rows (each with the position and tag of its first MAXT group) for QSA's block selection:
                     // qsa_pf_rows (FNX_PF_QSA_ROWS), or attn_rows() when the decode attention takes the groups too
                     const int AR = p.attn_dec ? attn_rows() : p.qsa_pf_rows;
@@ -1196,14 +1293,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             prefill_draft(C, set);
         }
     const auto t_enq = std::chrono::steady_clock::now();
-    // the next pass's rows (FNX_NGRAM=disk reads them, and a read can fail): its error waits until this pass has drained,
-    // so no caller that survives it (the lab's worker) goes on beside a pass still running
-    std::exception_ptr between_err;
-    try {
-        next_rows.get();
-    } catch (...) {
-        between_err = std::current_exception();
-    }
+    between();
     unsigned err = 0;
     // bounded: a copy-engine ring step waits on its flag without a timeout of its own
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
@@ -1220,14 +1310,6 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
         ckc(cudaMemcpy(&e, b.ring.err, 4, cudaMemcpyDeviceToHost), "err");
         err |= e;
     });
-    if (between_err && err) {
-        try {
-            std::rethrow_exception(between_err);
-        } catch (const std::exception& e) {
-            throw std::runtime_error(std::string(e.what()) + "; and in the same pass, prefill: ring error " + std::to_string(err));
-        }
-    }
-    if (between_err) std::rethrow_exception(between_err);
     if (err) throw std::runtime_error("prefill: ring error " + std::to_string(err));
     const auto t_main = std::chrono::steady_clock::now();
     if (mtp_ && draft8)

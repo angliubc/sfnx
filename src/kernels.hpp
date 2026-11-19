@@ -51,18 +51,12 @@ void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, 
 // the hyper-connection read (build_hc_mix) with the previous half's write folded in when bo_prev is not null:
 // R' = R + bo_prev * 2 sigmoid(inj_prev / HC); R <- R'; mixed = mean_c xn_c * sigmoid(up . silu(down . xn / HC));
 // inject = w_inj . xn (when w_inj); mixed also as q8_1 rows into q8 when not null. scratch: hc_scratch_floats(MAXT)
-// floats, zeroed once (its last float is the read's grid barrier counter). One launch of a block per SM (up to
-// hc_blocks()) that needs every one of them resident: nothing else may run beside it. err: bit 4 set when its barrier
-// timed out.
+// floats, zeroed once (its last float is the read's grid barrier counter). One launch that needs every SM of the card:
+// nothing else may run beside it. err: bit 4 set when its barrier timed out.
 size_t hc_scratch_floats(int T);
-int hc_blocks();    // the read's blocks of work; a card with fewer SMs runs them on one block per SM
-// sizes the read's grid to the current card (before its first hc_read or hc_preset_barrier) and zeroes the barrier
-// counter of scratch, the card's one hc scratch (the counter counts in generations of the grid it ran with); returns the
-// grid. cap > 0: at most cap blocks, as a card with that many SMs would run (kbench)
-int hc_prepare(float* scratch, int cap = 0);
 int hc1_rows();   // FNX_HC1: windows of up to this many rows take the read's one-barrier form (read once; throws if bad)
 void hc_read(float* R, const float* bo_prev, const float* inj_prev, const float* w_norm, const Q8S& w_down,
-             const Q8S& w_up, const uint16_t* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err,
+             const Q8S& w_up, const float* w_inj, float eps, float* mixed, float* inject, float* scratch, unsigned* err,
              int T, void* st, void* q8 = nullptr);
 // sets the barrier counter in an hc scratch so that it wraps after barriers_left more barriers (2 per read): a test
 // of the wrap (FNX_HC_BAR_WRAP)
@@ -136,15 +130,8 @@ __host__ __device__ inline int kv_local_block(int j) { return j / NCARD; }
 // int8 K/V (the default; FNX_KV8=0: f16): the K and V rows int8 in groups of 32 with an f16 scale each (llama.cpp's
 // q8_0); a layer's slot holds its K rows (int8), their scales, the V rows, their scales, then the pooled keys (f16
 // either way: QSA's block selection reads them). The pool then has as many more pages as fit in the f16 pool's bytes.
-#if FNX_27B
-// the 27B's pages hold S27_PP positions in S27_SLOTS slots, laid out as s27_attn.cuh says. The blocks and slots here are
-// Flash-Next's, for the attention kernels of kernels.cu a 27B build compiles and never launches
-constexpr int KVP_BLOCKS = 48, KVP_POS = S27_PP, KVP_SLOTS = 13;
-#else
 constexpr int KVP_BLOCKS = 48, KVP_POS = 192, KVP_SLOTS = 13;   // slots: 12 attention layers + the draft layer
-#endif
 static_assert(KVP_BLOCKS % NCARD == 0, "a page holds whole rounds of the cards");
-constexpr float RING_MAX = 65504.0f;   // fp16's largest finite value: past it a sum between cards is out of range
 constexpr int KV8_GROUP = 32;
 bool kv_q8();
 __host__ __device__ inline int kvp_rows(int) { return KVP_BLOCKS / NCARD * 4; }
@@ -312,12 +299,6 @@ struct RingMoe {
     const float* logits = nullptr;
 };
 
-// FNX_NGRAM=disk, verify: the n-gram flag's value for "the rows will not come" (the host's read failed): the window's
-// tag with this bit flipped, never the tag nor ~tag (its value before the rows). The cards give up on the rows after
-// NGRAM_WAIT_S (Ring::err bit 32; the abort is bit 64)
-constexpr unsigned NGRAM_ABORT = 0x40000000u;
-constexpr int NGRAM_WAIT_S = 10;
-
 // the sum across the cards (ring; words of two fp16 values and a tag); bufs are this card's receive buffers, peers'
 // via P2P
 struct Ring {
@@ -328,8 +309,7 @@ struct Ring {
     void* next_ag;
     unsigned* err;       // bit 1: a peer's value never came; bit 2: a NaN or inf (on the fp16 ring: a value past its
                          // range); bit 4: an hc read's grid barrier timed out; bit 16: a NaN or inf among the head's
-                         // logits (the window's argmax); bits 32, 64: layer 1's n-gram rows timed out or the host's
-                         // read failed (FNX_NGRAM=disk, verify's ngram_wait_copy_k)
+                         // logits (the window's argmax)
     bool f32 = false;    // fp32 words (buffers sized for them) instead of fp16 pairs
     int rows = MAXT;     // the row capacity the buffers were sized for
     // a ring for chunk-sized sums (plain fp16 words and a flag per block and hop): this card's flags and the next's
