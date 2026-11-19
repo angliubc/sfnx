@@ -1,0 +1,16 @@
+[Unit]
+Description=sfnx instance :8094 on atlas1 (qwen3.8-flash-next 1M prefill, 1113 single-node 1P1D)
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+User=atlas
+WorkingDirectory=/data/sfnx-prod
+ExecStart=/data/sfnx-prod/.venv/bin/python -m front.server --engine sfnx --config serve/sfnx-p-8094.json
+Restart=on-failure
+RestartSec=10
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+{
+  "backends": [
+    {
+      "name": "atlas1-8093",
+      "url": "http://<FLEET_HOST>:18095",
+      "pool": true
+    },
+    {
+      "name": "atlas1-8094",
+      "url": "http://<FLEET_HOST>:18096",
+      "pool": true
+    },
+    {
+      "name": "atlas8-8093",
+      "url": "http://<FLEET_HOST>:18097",
+      "pool": true
+    },
+    {
+      "name": "atlas8-8094",
+      "url": "http://<FLEET_HOST>:18098",
+      "pool": true
+    }
+  ]
+}
