@@ -764,6 +764,16 @@ class StrataEngine:
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
+        # (#1102) the engine's own vision tower ("vision.engine_tower"): its ENC answers ("VENC ...") come back on
+        # their own queue, so no request reader can eat them among the T/DONE lines; the engine reads one ENC while
+        # its answer is waited for, so a lock serialises the pictures.
+        self.enc_q: queue.Queue = queue.Queue()
+        self.enc_lock = threading.Lock()
+        # PD (the prefill hand-off): the PREAD/PDUMP/PLOAD answers ("PREAD OK ...", ...) come back
+        # on their own queue, so no request reader can eat them among the T/DONE lines (as VENC's);
+        # one at a time - the command and its answer must not interleave with another's.
+        self.pd_q: queue.Queue = queue.Queue()
+        self.pd_lock = threading.Lock()
         # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
         asked = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
@@ -838,6 +848,61 @@ class StrataEngine:
         lines.put(None)
         for q in slot_q:
             q.put(None)
+        enc_q.put(None)                                 # (#1102) an ENC wait must not outlive the engine
+        pd_q.put(None)                                  # (PD: the same)
+
+    def enc(self, image_path: str, out_path: str, timeout: float) -> str:
+        """(#1102) `ENC <image> <out>` to the engine's own vision tower ("vision.engine_tower"): the answer line
+        ("VENC OK <n> <nx> <ny> <ms>", or "VENC ERR <why>") comes back on enc_q, _pump having kept it out of the
+        request lines.  One picture at a time: the engine reads one ENC while its answer is waited for, so the
+        whole call holds a lock.  The process is read at call time (a restart replaces it, #344)."""
+        proc, enc_q = self.proc, self.enc_q              # this process's: a restart replaces both (#344)
+        if proc is None:
+            raise RuntimeError("the engine is not running")
+        with self.enc_lock:
+            try:
+                proc.stdin.write(f"ENC {image_path} {out_path}\n")
+                proc.stdin.flush()
+            except (OSError, ValueError) as e:           # the pipe is gone (the engine died under the write)
+                raise RuntimeError(f"the engine's vision tower is gone ({e})") from None
+            end = None if timeout is None else time.monotonic() + timeout
+            while True:
+                left = None if end is None else end - time.monotonic()
+                if left is not None and left <= 0:
+                    raise RuntimeError(f"the image could not be read: the engine said nothing for {timeout:.0f} s")
+                try:
+                    line = enc_q.get(timeout=left)
+                except queue.Empty:
+                    continue
+                if line is None:                         # the engine's output closed: it is gone
+                    raise RuntimeError("the engine's vision tower is gone")
+                return line
+
+    def pd_cmd(self, text: str, timeout: float | None) -> str:
+        """A PD command (PREAD/PDOFFER/PDUMP/PLOAD) to the engine, its answer from pd_q (as enc's: the request
+        readers cannot eat it).  One at a time, under pd_lock; the process is read at call time
+        (a restart replaces it, #344)."""
+        proc, pd_q = self.proc, self.pd_q               # this process's: a restart replaces both (#344)
+        if proc is None:
+            raise RuntimeError("the engine is not running")
+        with self.pd_lock:
+            try:
+                proc.stdin.write(text + "\n")
+                proc.stdin.flush()
+            except (OSError, ValueError) as e:
+                raise RuntimeError(f"the engine is gone ({e})") from None
+            end = None if timeout is None else time.monotonic() + timeout
+            while True:
+                left = None if end is None else end - time.monotonic()
+                if left is not None and left <= 0:
+                    raise RuntimeError(f"PD: the engine said nothing for {timeout:.0f} s")
+                try:
+                    line = pd_q.get(timeout=left)
+                except queue.Empty:
+                    continue
+                if line is None:                         # the engine's output closed: it is gone
+                    raise RuntimeError("the engine is gone")
+                return line
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -1966,17 +2031,22 @@ class Vision:
                              "line cannot name a file there: set TMPDIR to a path without spaces")
         return d
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
-        args = self.reader_args(cfg)
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False, engine=None):
+        self.engine = engine                            # (#1102) the engine's own vision tower ("vision.engine_tower"):
+        if engine is not None:                          # no reader process of this class's own - ENC rides the engine's
+            args = []                                   # stdin, its answer comes back on the engine's enc_q; the reader's
+            self.fallback = None                        # exe/model and the CPU fallback are not needed
+        else:
+            args = self.reader_args(cfg)
+            # the config's "cpu_exe": the CPU reader the GPU one falls back on when it does not start (the card is full
+            # or busy); _start switches to it by itself
+            if cfg.get("gpu") and cfg.get("cpu_exe"):
+                cpu = {k: v for k, v in cfg.items() if k != "cpu_exe"} | {"exe": cfg["cpu_exe"], "gpu": False}
+                self.fallback = (self.reader_args(cpu), log, env)
+            else:
+                self.fallback = None
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after it died (restart)
-        # the config's "cpu_exe": the CPU reader the GPU one falls back on when it does not start (the card is full or
-        # busy); _start switches to it by itself
-        if cfg.get("gpu") and cfg.get("cpu_exe"):
-            cpu = {k: v for k, v in cfg.items() if k != "cpu_exe"} | {"exe": cfg["cpu_exe"], "gpu": False}
-            self.fallback = (self.reader_args(cpu), log, env)
-        else:
-            self.fallback = None
         self.proc = None
         self.stopped = True
         self.lock = threading.Lock()
@@ -2190,19 +2260,28 @@ class Vision:
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
-                self.proc.stdin.write(f"ENC {img.name} {out.name}\n")      # relative to the encoder's cwd (#480)
-                self.proc.stdin.flush()
-                try:
-                    line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
-                except RuntimeError as e:                 # silent for VISION_ENCODE_S: the encoder was ended (#1317)
-                    self.stopped = True                   # alive() is False, so the next request starts it again
-                    raise ValueError(str(e)) from None
+                if self.engine is not None:             # (#1102) the engine's own tower: absolute paths (the engine's
+                    line = self.engine.enc(str(img), str(out), VISION_ENCODE_S).strip()   # cwd is the model's, not this dir)
+                else:
+                    self.proc.stdin.write(f"ENC {img.name} {out.name}\n")      # relative to the encoder's cwd (#480)
+                    self.proc.stdin.flush()
+                    try:
+                        line = self._readline(VISION_ENCODE_S, "the image could not be read").strip()
+                    except RuntimeError as e:                 # silent for VISION_ENCODE_S: the encoder was ended (#1317)
+                        self.stopped = True                   # alive() is False, so the next request starts it again
+                        raise ValueError(str(e)) from None
             finally:                                                   # #352: also when the encoder's pipe is gone
                 img.unlink(missing_ok=True)
-            if not line.startswith("OK"):
-                raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
-                                                                     "the vision encoder stopped"))
-            self.cache[key] = (out, int(line.split()[1]))
+            if self.engine is not None:                 # (#1102) the engine's answer is prefixed "VENC" (a bare OK/ERR
+                if not line.startswith("VENC OK"):      # would be eaten by a request reader among the T/DONE lines)
+                    raise ValueError("the image could not be read: " + (line[8:] if line.startswith("VENC ERR") else
+                                                                        "the vision tower stopped"))
+                self.cache[key] = (out, int(line.split()[2]))
+            else:
+                if not line.startswith("OK"):
+                    raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
+                                                                        "the vision encoder stopped"))
+                self.cache[key] = (out, int(line.split()[1]))
             held = {str(p) for p in keep} | {str(out)}
             for old in list(self.cache):                               # oldest first, but never one still in use
                 if len(self.cache) <= 64:
@@ -5485,6 +5564,18 @@ def check_config(path) -> None:
             ok = False
         if not ok:
             raise SystemExit(f"[sfnx] {path}: rope scale {s!r}: want 1 (off) or a number above 1")
+    vision = cfg.get("vision") or {}
+    if isinstance(vision, dict) and vision.get("engine_tower"):
+        # (#1102) the engine's own tower: no reader process, so the reader's "exe"/"cpu_exe" are not needed, but the
+        # mmproj file is (the engine's --vision-model names it) and the engine must be started with the tower on
+        if not isinstance(vision["engine_tower"], bool):
+            raise SystemExit(f'[sfnx] {path}: "vision.engine_tower" must be true or false, not {vision["engine_tower"]!r}')
+        if not vision.get("mmproj"):
+            raise SystemExit(f'[sfnx] {path}: "vision.engine_tower" needs "mmproj" (the file "--vision-model" names)')
+        for flag in ("--vision", "--vision-model"):
+            if flag not in args:
+                raise SystemExit(f'[sfnx] {path}: "vision.engine_tower" needs "{flag}" in "args" (the engine reads '
+                                 "pictures only then)")
     cwd = cfg["cwd"]
     tok = Path(cfg.get("tokenizer") or "")
     files = {f"tokenizer's {n}": tok / n for n in ("vocab.json", "merges.txt", "token_type.json")}
@@ -5753,7 +5844,9 @@ def main(argv=None) -> int:
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[sfnx] sampling defaults from the config: {pretty}", flush=True)
-        if cfg.get("vision"):
+        tower = isinstance(cfg.get("vision"), dict) and cfg["vision"].get("engine_tower") is True
+        tower_cfg = None
+        if cfg.get("vision") and not tower:
             print("[sfnx] loading the vision encoder ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
@@ -5761,6 +5854,12 @@ def main(argv=None) -> int:
                     for k, v in cfg["vision"].items()}
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env))
+        elif tower:
+            # (#1102) the engine's own tower: no reader process to start here; the Vision is made after the engine
+            # (its ENC rides the engine's stdin, so the engine must exist first)
+            tower_cfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                             if k in ("exe", "cpu_exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+                         for k, v in cfg["vision"].items()}
         print("[sfnx] loading the model ...", flush=True)
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
         try:
@@ -5769,6 +5868,10 @@ def main(argv=None) -> int:
             raise SystemExit(f"[sfnx] config {e}")
         engine = StrataEngine(exe, engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        if tower:
+            print("[sfnx] pictures are read by the engine's own vision tower (--vision-model)", flush=True)
+            vision = Vision(tower_cfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                            env=vision_env(cfg, env), engine=engine)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."],
