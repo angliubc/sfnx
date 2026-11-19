@@ -140,6 +140,19 @@ REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my 
 # its turn: it is replaced by the marker's text and the reply goes on, at most this many times per reply.
 # STRATA_LITERAL_STOP=0 turns it off.
 LITERAL_STOPS_PER_REPLY = 4
+# 1113: opt-in "premature_stop_retry": true — a reply that ends on its stop token right after a dangling colon
+# (`:` / `：`) or a single-line tool-action preamble with zero tool calls is continued in-place on the hot lane
+# with `\n\n` (token 271, matching chat_template.jinja's `content + '\n\n<tool_call>\n'`), up to 2 times.
+# STRATA_PREMATURE_STOP=0 turns it off.
+PREMATURE_STOPS_PER_REPLY = 2
+_ACTION_PREAMBLE_RE = re.compile(
+    r"^(?:"
+    r"(?:I'll|I will|Let's|Let me|Now let me|First,? let me|First,? I'll)\s+"
+    r"(?:start by|begin by|check|read|fetch|inspect|examine|search|grep|run|look at|list|discover|verify|pull|open|query|scan|test)\b"
+    r"|(?:我先|现在我先|接下来我先|下面我先|让我先|先来)(?:检查|查看|读取|拉取|获取|看看|跑|执行|查一下|核对|探测|扫描)"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def in_open_code(text: str) -> bool:
@@ -2079,6 +2092,9 @@ class Vision:
         """Start the reader.  When a GPU reader that has a CPU reader to fall back on does not start (the GPU runtime does not
         load, the card is not in its build, the card is busy), the CPU reader is started instead, for good, with one log line
         and no question."""
+        if getattr(self, "engine", None) is not None:   # (#1102) the tower runs in the engine's process: nothing to start
+            self.stopped = False
+            return
         try:
             self._start_reader()
         except (RuntimeError, OSError) as e:
@@ -2136,6 +2152,8 @@ class Vision:
             raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
 
     def alive(self) -> bool:
+        if self.engine is not None:                     # (#1102) the tower lives in the engine's process: alive while
+            return self.engine.proc is not None and not self.engine.ended   # it is; a restart() here is a no-op
         return self.proc is not None and not self.stopped and self.proc.poll() is None
 
     def unload(self):
@@ -2145,6 +2163,8 @@ class Vision:
 
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
+        if self.engine is not None:                     # (#1102) the tower is the engine's own: restarting the
+            return                                      # engine (ensure_loaded's next step) brings it back
         if self.proc is not None:
             try:
                 self.proc.kill()
@@ -2525,6 +2545,7 @@ class Service:
 
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        self.premature_stop_retry = False             # 1113 (opt-in): continue in-place when a reply stops on ':' or a tool preamble
 
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.model_arch = None                        # "qwen4exp" with the engine; None (the mock) = no model-card defaults
@@ -3476,6 +3497,11 @@ class Service:
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
+        called, content_written = False, ""             # 1113: whether any tool call fired; visible post-think content
+        _last_u = _last_user_text_of_req(sampling)
+        _premature_excl = ("Do not use tools." in _last_u
+                           or "Perform a web search for the query: " in _last_u
+                           or (max_new is not None and max_new < 128))
         timings, before = None, None                    # this request's timings; the engine's `last` before it
 
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
@@ -3665,6 +3691,10 @@ class Service:
                                 for ev in evs:
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
+                                    if ev.kind == "content" and ev.text:
+                                        content_written += ev.text
+                                    elif ev.kind in ("tool_start", "tool_call"):
+                                        called = True
                                     yield "event", ev
                                 if evs:
                                     last_out = time.perf_counter()
@@ -3727,6 +3757,10 @@ class Service:
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
                                 for ev in evs:
+                                    if ev.kind == "content" and ev.text:
+                                        content_written += ev.text
+                                    elif ev.kind in ("tool_start", "tool_call"):
+                                        called = True
                                     yield "event", ev
                             prompt = prompt + seg + literal
                             finish = "length"           # overwritten by how the continued pass ends
@@ -3746,13 +3780,54 @@ class Service:
                                     n += 1
                                     raw_ids.append(t)
                                     thinking_n += parser.state in ("reasoning", "rcall")
-                                    evs = cut(parser.feed(detok.push(t)))
+                                    piece = detok.push(t)
+                                    written += piece
+                                    evs = cut(parser.feed(piece))
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
+                                        if ev.kind == "content" and ev.text:
+                                            content_written += ev.text
+                                        elif ev.kind in ("tool_start", "tool_call"):
+                                            called = True
                                         yield "event", ev
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        if (premature_left and finish == "stop" and seg and not called
+                                and not wrap and not opens and parser.state == "content"
+                                and not parser.buf and not detok.pending() and not parser.pending
+                                and (stops is None or stops.hit is None) and not cancel.is_set()):
+                            pkind = premature_stop_kind(content_written, bool(tools))
+                            if pkind is not None:
+                                pad = "\n" if content_written.endswith("\n") else "\n\n"
+                                extra = self.tok.encode(pad, parse_special=False)
+                                if max_new - n - len(extra) >= 1:
+                                    premature_left -= 1
+                                    preview = content_written.strip()[-60:].replace("\n", "\\n")
+                                    print(f"[sfnx] premature stop on {pkind} ({preview!r}, {n} tok, tools=0): "
+                                          f"continuing in-place ({PREMATURE_STOPS_PER_REPLY - premature_left}/"
+                                          f"{PREMATURE_STOPS_PER_REPLY})", flush=True)
+                                    for t in extra:
+                                        n += 1
+                                        raw_ids.append(t)
+                                        thinking_n += parser.state in ("reasoning", "rcall")
+                                        piece = detok.push(t)
+                                        tail = (tail + piece)[-2:]
+                                        written += piece
+                                        evs = cut(parser.feed(piece))
+                                        self._note(n, evs, st, rate)
+                                        for ev in evs:
+                                            if ev.kind == "content" and ev.text:
+                                                content_written += ev.text
+                                            elif ev.kind in ("tool_start", "tool_call"):
+                                                called = True
+                                            yield "event", ev
+                                    if stops is not None and stops.hit is not None:
+                                        finish = "stop"
+                                        break
+                                    prompt = prompt + seg + extra
+                                    finish = "length"
+                                    continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
@@ -3776,9 +3851,15 @@ class Service:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
-                            evs = cut(parser.feed(detok.push(t)))
+                            piece = detok.push(t)
+                            written += piece
+                            evs = cut(parser.feed(piece))
                             self._note(n, evs, st, rate)
                             for ev in evs:
+                                if ev.kind == "content" and ev.text:
+                                    content_written += ev.text
+                                elif ev.kind in ("tool_start", "tool_call"):
+                                    called = True
                                 yield "event", ev
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
@@ -4832,6 +4913,7 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
+            setattr(cancel, "_pd_conv", pd_conv_key(messages))   # 1111 P-pool: the conversation's P-affinity key
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -4875,6 +4957,11 @@ def make_handler(svc: Service):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (front/responses.py), on the chat path.
             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
             cancel = threading.Event()
+            try:                                             # 1111 P-pool affinity; an invalid request
+                setattr(cancel, "_pd_conv",                  # (no input etc.) 400s before any hand-off -
+                        pd_conv_key(responses_api.input_messages(req)))   # skip the key, keep the 400
+            except Exception:
+                pass
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
@@ -5185,6 +5272,7 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
+            setattr(cancel, "_pd_conv", pd_conv_key(messages))   # 1111 P-pool: the conversation's P-affinity key
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
