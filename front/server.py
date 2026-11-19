@@ -150,9 +150,83 @@ def in_open_code(text: str) -> bool:
     return line.count("`") % 2 == 1
 
 
+def _last_user_text_of_req(req: dict | None, cap: int = 8192) -> str:
+    """1113: trailing text of the last user message across Chat Completions, Anthropic Messages, and Responses."""
+    if not isinstance(req, dict):
+        return ""
+    inp = req.get("input")
+    if isinstance(inp, str):
+        return inp[-cap:]
+    msgs = req.get("messages") if isinstance(req.get("messages"), list) else inp
+    if not isinstance(msgs, list):
+        return ""
+    for m in reversed(msgs):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c[-cap:]
+        if isinstance(c, list):
+            parts = [b.get("text", "") for b in c if isinstance(b, dict) and isinstance(b.get("text"), str)]
+            txt = "\n".join(p for p in parts if p)
+            if txt:
+                return txt[-cap:]
+    return ""
+
+
+def premature_stop_kind(content_text: str, has_tools: bool) -> str | None:
+    """1113: 'colon' or 'preamble' when `content_text` ended on a premature stop marker outside code."""
+    if not content_text or in_open_code(content_text):
+        return None
+    s = content_text.rstrip().rstrip("*_").rstrip()
+    if not s:
+        return None
+    if s[-1] in (":", "："):
+        return "colon"
+    if has_tools and len(s) <= 220 and "\n" not in s and s[-1] in (".", "。"):
+        if _ACTION_PREAMBLE_RE.search(s):
+            return "preamble"
+    return None
+
+
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
+
+# PD (the prefill hand-off): a prefill-side front ("P") publishes what it read on a lane, a decode-side
+# front ("D") pulls it in and decodes from there.  Both sides run the same engine build.  The P side's
+# config names a pd_role ("P" or "D"); the D side also names the P front's URL(s): pd_peers lists
+# every P in the pool (a lone pd_peer is a one-P pool; 1111 unbound - any P serves any D, a
+# conversation keeps the P its cache warmed).  Dump files land in pd_dir (default: the system temp
+# dir) under pd-<hex of the prompt's keep_key>-<n>.bin; the D side fetches them from /pd/blob/<name>.
+PD_MIN_TOKENS = 4000        # below this a hand-off costs more than it saves (a PREAD lane, a
+                            # dump, a fetch, a PLOAD - ~2s of fixed round trip)
+
+
+def pd_conv_key(messages) -> str:
+    """1111 P-pool: the conversation key a D's P-affinity rides - md5 of the first user message,
+    the same first-message anchor the sfnx gateway's session stickiness hashes (a CC fleet shares
+    one system prompt, so a prompt-prefix key would fuse every conversation onto one P)."""
+    for m in messages or []:
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and c:
+            return hashlib.md5(c.encode()).hexdigest()
+        if isinstance(c, list) and c:
+            texts = "".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+            return hashlib.md5(texts.encode()).hexdigest() if texts \
+                else hashlib.md5(json.dumps(m, sort_keys=True).encode()).hexdigest()
+        if c:
+            return hashlib.md5(str(c).encode()).hexdigest()
+    return "noconv"
+_PD_SEQ = threading.Lock()  # 1110: the P side's PREAD+PDUMP pair runs one at a time (a second D's
+                            # PREAD could park the first's lane before its PDUMP read it)
+
+# a peer is another engine front on the LAN: never through this machine's http_proxy (26/27 carry one
+# in their shells; the front process inherits it, and urllib would route the peer through it)
+import urllib.request as _pd_urllib
+pd_opener = _pd_urllib.build_opener(_pd_urllib.ProxyHandler({}))
 # Anthropic clients add /v1/messages to their base URL themselves. A base URL that already ends in /v1 (copied from an OpenAI-style
 # setup) makes them post /v1/v1/messages; these two paths mean the same as the real ones. Nothing else is aliased.
 V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
@@ -731,8 +805,17 @@ class StrataEngine:
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
+        enc_q = self.enc_q                              # (#1102) the tower's VENC answers, the same lifetime
+        pd_q = self.pd_q                                # PD's answers (PREAD/PDUMP/PLOAD), the same lifetime
         line = None
         for line in proc.stdout:
+            if line.startswith("VENC "):                # (#1102) an ENC answer: not! a request's line (a bare
+                enc_q.put(line)                         # OK/ERR would be eaten by one among the T/DONE lines)
+                continue
+            if line.startswith(("PREAD ", "PDOFFER ", "PDUMP ", "PLOAD ", "PDSTREAM ",
+                                "ERR PREAD", "ERR PDOFFER", "ERR PDUMP", "ERR PLOAD", "ERR PDSTREAM")):
+                pd_q.put(line)                          # PD: the same trick (a bare OK/ERR would be
+                continue                                # eaten the same way; the engine's two error shapes)
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -2628,6 +2711,257 @@ class Service:
         meter = getattr(self.engine, "read_meter", None)
         return meter.rate() if meter is not None else None
 
+    # ---- PD (the prefill hand-off) -------------------------------------------------------
+    # The D side's orchestrator.  Called with the request's ids right before the engine.generate() of
+    # the first segment: when this front is a D and its peer P can prefill the prompt faster (the
+    # engine's own tok/s vs the hand-off's round trip), the prompt is handed off:
+    #   /pd/offer on the P front -> PDOFFER, one engine line: the read of the whole prompt onto a
+    #                                 lane (the engine's read holds the last token back itself, as
+    #                                 GEN's own prompts ride, so the ring is exactly the prefix the
+    #                                 D's generate resumes from) and the dump, with nothing between;
+    #                                 the read's K/V is on the plain rotary, so a YaRN P hands off
+    #                                 to an unscaled D
+    #   GET /pd/blob/<name>      -> the file itself (a stream) [1111: RETIRED on the D side - the
+    #                               dump+fetch file path is gone, every size rides /pd/pread_stream]
+    #   PLOAD 0 <local copy>     -> the D engine loads it; the local GEN's ids then hit usable()'s
+    #                                 "the loaded history, one short" case: every token but one reused.
+    # A failure of any step is a plain local generate (correct, only slower); nothing PD ever changes
+    # the answer, only where the prompt's K/V came from.
+    def pd_hands_off(self, ids: list[int], cancel) -> bool:
+        """The one decision (1110 evening reroute).  The morning's rate comparison never fired:
+        an idle engine's meter reads None, and None skipped the comparison - every prompt above
+        PD_MIN_TOKENS handed off, an idle D queueing behind the P's one serial PREAD lane (the
+        107s/117s TTFTs).  The truth the logs proved: an idle D reads locally at the same
+        ~3600 tok/s a P would spend, so a hand-off only pays when this D is BUSY (its read
+        runs at ~769 tok/s under decode interference - the isolation P exists for).  A busy P
+        (mid-PREAD, one lane, serialized by _PD_SEQ) still beats a degraded local read for
+        huge prompts, but for smaller ones queueing loses: below 40K stay local then."""
+        if not getattr(self, "pd_peers", None):
+            return False
+        if len(ids) < PD_MIN_TOKENS:
+            return False
+        e = self.engine                       # the stream takes every size (1111: the 260K cap and
+        if not getattr(e, "batch", 0):        # the file fallback are gone); a stream failure is a
+            return False                      # local generate, which for a busy D's huge prompt is
+        with e.slot_cv:                       # the only road left - the 487K lesson stays honored
+            with self.status_lock:            # the requester itself is in live_reqs by now (the
+                # opening pass adds it); a solo run keeps every slot False - count it, or a lone
+                # decode misjudges the engine idle and hogs the rotary.  1111: a request PARKED on
+                # a peer P (pd_handoff waiting out the peer's serial read) holds no engine resource
+                # here - counting it as "others" made one hand-off park the whole D (every later
+                # request read the engine busy, queued behind the P's ONE lane; the decode GPUs sat
+                # at 0% while both Ps ran back-to-back).  Only requests that contend for this
+                # rotary - reading, decoding, engine-queued - make the engine busy.
+                others = len(self.live_reqs) - 1 - self._pd_parked
+            if not (any(e.slot_busy) or e.waiting > 0 or others > 0):
+                self.pd_note(f"decision: idle engine, {len(ids)} tokens - local")
+                return False
+            busy_n = sum(1 for b in e.slot_busy if b)
+        peer = self.pd_pick(ids, cancel)      # 1111: WHICH P is a per-conversation question now -
+        if peer is None:                      # same conversation keeps the P its cache warmed,
+            return False                      # a fresh one takes a free P (not piling on one)
+        if len(ids) < 40000 and self._pd_peer_busy(peer):
+            return False                      # the P is mid-read: a small prompt reads faster here
+        # 1111 (the "both Ps busy all day" shape): no decode lane held and nothing queued on the
+        # engine - at most sibling reads are in flight (parked hand-offs no longer count, and a
+        # sibling's own local read shows as "others", not as busy slots).  Queueing behind the
+        # picked P's ONE serial lane while it finishes a foreign 170K read (50-100s) loses to a
+        # local read that starts now - full speed alone, shared rotary with a sibling - and it
+        # deepens the P's queue for the requests that truly need it (a decoding D's ~769 tok/s
+        # read, the isolation the P exists for).
+        if busy_n == 0 and e.waiting == 0 and self._pd_peer_busy(peer):
+            self.pd_note(f"decision: no decode here, the P's serial lane is mid-read - local")
+            return False
+        self.pd_note(f"decision: {len(ids)} tokens, {busy_n} slot(s) busy, {e.waiting} waiting - "
+                     f"handing off to {peer}")
+        return True
+
+    def pd_pick(self, ids, cancel) -> str | None:
+        """1111 P-pool: which P front this hand-off rides.  The conversation-affinity pin is
+        RETIRED (1111 evening): a probe fired the same 149K-token prompt at one P five times and
+        every read came back reused=0 - PDSTREAM unloads the lane it read, so a P retains nothing
+        between hand-offs and pinning only ever piled conversations onto one busy lane (2 of the
+        fleet's 3 live sessions shared P-8094 while P-8093 idled).  What remains is spread: the
+        conversation key's hash picks the starting P (not the list order - every fresh
+        conversation on every D would otherwise converge on peers[0]), a busy starting P defers
+        to the next free one (/pd/busy - the PREAD lane is serial, a busy P queues the next
+        hand-off 20-45s), round-robin when every P is mid-read (a busy P still beats a degraded
+        local read for huge prompts).  Re-add a pin only with an engine that RETAINS a hand-off's
+        K/V between requests."""
+        peers = self.pd_peers
+        if not peers:
+            return None
+        if len(peers) == 1:
+            return peers[0]
+        key = getattr(cancel, "_pd_conv", None) or hashlib.md5(str(ids[:256]).encode()).hexdigest()
+        start = int(hashlib.md5(key.encode()).hexdigest()[:8], 16) % len(peers)
+        pick = None
+        for i in range(len(peers)):
+            p = peers[(start + i) % len(peers)]
+            if not self._pd_peer_busy(p):
+                pick = p
+                break
+        if pick is None:                      # all mid-read: spread them instead of piling on one
+            pick = peers[(start + self._pd_rr) % len(peers)]
+            self._pd_rr += 1
+        self.pd_note(f"pick: conversation {key[:8]} -> {pick}")
+        return pick
+
+    def _pd_peer_busy(self, peer: str) -> bool:
+        """Whether the peer P is inside a hand-off (its _PD_SEQ held - the PREAD lane is serial,
+        a second hand-off queues behind a 20-45s read).  Unreachable peer -> False (the hand-off
+        itself then fails soft to a local generate, so a wrong False is harmless either way)."""
+        try:
+            with pd_opener.open(peer.rstrip("/") + "/pd/busy", timeout=2.0) as r:
+                return bool(json.loads(r.read().decode()).get("busy"))
+        except Exception:
+            return False
+
+    def pd_fetch(self, peer: str, name: str, timeout: float = 120.0) -> Path:
+        """The peer's dump file, streamed to pd_dir."""
+        import urllib.request
+        url = peer.rstrip("/") + "/pd/blob/" + name
+        out = self.pd_dir / name
+        with pd_opener.open(url, timeout=timeout) as r, open(out, "wb") as f:
+            while True:
+                b = r.read(1 << 20)
+                if not b:
+                    break
+                f.write(b)
+        return out
+
+    def pd_ready(self) -> bool:
+        """1110 2P4D, evening fix: this gate once demanded a free lane AND an empty queue - which
+        barred a hand-off exactly when the engine is congested, the one state a P exists for (a
+        queued request went local and its 180K+ read hogged the rotary for minutes, 1110 prod).
+        The worth-it question now lives wholly in pd_hands_off (idle vs busy, prompt size, peer
+        state); what remains here is only "can this front host a PLOAD at all" - a lane that
+        filled meanwhile costs a refused PLOAD (pd_cmd answers, the caller generates locally),
+        never a stuck request."""
+        return bool(getattr(self.engine, "batch", 0))
+
+    def pd_handoff(self, ids, cancel) -> tuple[Path, int] | None:
+        """The whole hand-off, or None (the caller generates locally).  ids must be what the local
+        engine will get; the peer reads them ALL - its read holds the last token back itself (as
+        GEN's own prompts ride), so the ring lands on exactly the prefix a GEN resumes from and the
+        local generate appends nothing.  One /pd/pread_stream round (1110 direct-IB step 1): the
+        peer's engine reads and pushes the dump's bytes straight to a one-shot listener here - no
+        file on either host's disk, no /pd/blob fetch.  1111: the file path (/pd/pread_dump +
+        /pd/blob) is GONE - every size rides the stream (its timeouts already scale with the
+        prompt; with the load piled on the Ps the per-item file tax had stopped being rare), and a
+        stream that fails falls straight to None = a local generate.  While the peer's serial read
+        runs we are PARKED (counted in _pd_parked, not "others busy") - pd_hands_off keeps reading
+        the engine idle while requests merely wait on a P."""
+        if cancel is not None and cancel.is_set():
+            return None
+        peer = self.pd_pick(ids, cancel)      # 1111: a fresh pick (the affinity memo is retired -
+        if peer is None:                      # it may land on a different free P than the decision
+            return None                       # pass saw, which is exactly the point of spreading)
+        if not getattr(self, "pd_stream", True):
+            return None                       # the file path is retired; pd_stream=false now means
+        with self._pd_park_lock:              # "no hand-off", not "the old dump route"
+            self._pd_parked += 1
+        try:
+            return self.pd_handoff_stream(peer, ids, cancel)
+        finally:
+            with self._pd_park_lock:
+                self._pd_parked -= 1
+
+    def pd_handoff_stream(self, peer: str, ids, cancel) -> tuple[Path, int] | None:
+        """1110 direct-IB step 1: the dump's bytes pushed to us over a socket, not fetched from a
+        file.  A one-shot listener comes up first (its port and a nonce are what the peer's
+        /pd/pread_stream rides on), then the peer's engine PDSTREAMs the exact byte sequence PDUMP
+        would have written.  We still land it in a local file - PLOAD reads files - but our own
+        pd_dir (shm on the D side), so no disk either way.  Never raises: None hands back to a
+        local generate."""
+        import socket
+        nonce = uuid.uuid4().hex                # 1111: the 260K cap is retired with the file path
+        # it guarded - every size rides the stream; the timeouts below scale with the prompt, and
+        # the biggest dump (1M tokens, ~19 GiB) is still a plain 1 MiB-read loop into pd_dir (shm)
+
+        # the push waits out the peer's READ first (len/3600 s at the P's pace) before the first
+        # byte: scale every socket timeout with the prompt, or a big hand-off times out mid-read
+        tmo = max(self.pd_peer_timeout, 120 + len(ids) // 1800)
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((self.pd_stream_host, 0))        # the host that can reach the peer, port chosen
+            srv.listen(1)
+            srv.settimeout(tmo)
+            host, port = srv.getsockname()
+            # the POST rides a thread: the peer's engine starts pushing the moment its front
+            # takes the request, so the accept (and the drain) must already be waiting - a
+            # sequential POST-then-accept deadlocks on the socket buffers (the POST cannot
+            # return before the push ends, the push cannot end before somebody reads)
+            box = {}
+            def _offer():
+                try:
+                    req = urllib.request.Request(
+                        peer.rstrip("/") + "/pd/pread_stream",
+                        data=json.dumps({"ids": ids, "cb_host": host, "cb_port": port, "nonce": nonce}).encode(),
+                        headers={"Content-Type": "application/json"})
+                    with pd_opener.open(req, timeout=tmo) as r:   # scaled: the answer rides the push
+                        box["offer"] = json.loads(r.read().decode())
+                except Exception as e:                             # noqa: BLE001 - reported below
+                    box["err"] = e
+            th = threading.Thread(target=_offer, daemon=True, name="pd-stream-offer")
+            th.start()
+            # 1116: this accept once blocked the whole tmo before anyone looked at the offer's
+            # box - a refusing peer (the 1113 P clone ran an engine without PDSTREAM and its
+            # 502 came back in ~1 s) still parked every handed-off request the full 300 s
+            # before the local fallback: ~40 requests x 5 min on the 1116 morning.  The peer
+            # only pushes BEFORE it answers (its 200 rides the push's end), so an answered
+            # offer - an err or a not-ok body - means no push is ever coming: bail at once.
+            try:
+                conn = None
+                deadline = time.monotonic() + tmo
+                srv.settimeout(5.0)
+                while conn is None:
+                    if "err" in box or (box.get("offer") is not None and not box["offer"].get("ok")):
+                        th.join(timeout=30.0)
+                        why = box.get("err") or box.get("offer")
+                        print(f"[sfnx] PD stream skipped: the peer refused ({why!r:.180})", flush=True)
+                        return None
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out")
+                    try:
+                        conn, _ = srv.accept()
+                    except socket.timeout:
+                        pass
+                try:
+                    conn.settimeout(tmo)
+                    with conn.makefile("rb") as rf:    # buffered reads; a 8 GiB body stays a stream
+                        first = rf.readline().strip()
+                        if first != ("NONCE " + nonce).encode():
+                            return None                # not our push: a stray connection, drop it
+                        path = self.pd_dir / f"pd-{nonce}.bin"
+                        with open(path, "wb") as f:
+                            while True:
+                                b = rf.read(1 << 20)
+                                if not b:
+                                    break
+                                f.write(b)
+                finally:
+                    conn.close()
+            finally:
+                srv.close()
+            th.join(timeout=30.0)                      # the offer lands with the push's end
+            if "err" in box or not (box.get("offer") or {}).get("ok"):
+                try:
+                    path.unlink()
+                except (OSError, NameError, UnboundLocalError):
+                    pass
+                return None
+            return path, int(box["offer"].get("reused") or 0)
+        except Exception as e:                 # a PD failure is never the request's failure
+            print(f"[sfnx] PD stream skipped: {type(e).__name__}: {e}", flush=True)
+            return None
+
+    def pd_note(self, note: str):
+        """One line in the log: what PD did for the last request (the Monitor's sake)."""
+        if getattr(self, "pd_role", None):
+            print(f"[sfnx] PD {note}", flush=True)
+
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
         if not self.api_monitor:
@@ -3142,11 +3476,62 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    pd_tried = False                    # PD: the first segment's one hand-off try
                     literal_left = LITERAL_STOPS_PER_REPLY if os.environ.get("STRATA_LITERAL_STOP", "1") != "0" else 0
+                    premature_left = (PREMATURE_STOPS_PER_REPLY
+                                      if self.premature_stop_retry and not _premature_excl
+                                      and os.environ.get("STRATA_PREMATURE_STOP", "1") != "0"
+                                      else 0)
                     written = ""                        # the decoded reply so far (open code span or fence?)
                     for ev in opening:
+                        if ev.kind == "content" and ev.text:
+                            content_written += ev.text
+                        elif ev.kind in ("tool_start", "tool_call"):
+                            called = True
                         yield "event", ev
                     while True:
+                        if not pd_tried and not n and not emb:   # PD: once, before the first read; never
+                            pd_tried = True                       # for a request with pictures (the tower's
+                            if getattr(self, "pd_role", None) == "D" and self.pd_ready() and self.pd_hands_off(ids, cancel):
+                                # 1110: the hand-off itself is 30-60s of silence (peer read, dump,
+                                # blob fetch) - run it off-thread and ping the SSE stream, or an
+                                # intermediate proxy times the silent stream out and cancels us.
+                                _box = {}
+                                def _handoff():
+                                    _box["got"] = self.pd_handoff(ids, cancel)
+                                # 1111 P-pool: pd_handoff re-picks inside (memoized - same
+                                # conversation key, same P as the decision pass just chose)
+                                th = threading.Thread(target=_handoff, daemon=True, name="pd-handoff")
+                                th.start()
+                                while th.is_alive():
+                                    th.join(5.0)
+                                    yield "ping", None
+                                got = _box.get("got")
+                                if got is not None:
+                                    path, reused = got
+                                    try:
+                                        pslot = 0
+                                        if hasattr(self.engine, "slot_cv"):
+                                            with self.engine.slot_cv:
+                                                sb = self.engine.slot_busy
+                                                pslot = sb.index(False) if sb and False in sb else None
+                                        if pslot is not None:
+                                            line = self.engine.pd_cmd(f"PLOAD {pslot} {path}", timeout=None) \
+                                                if hasattr(self.engine, "pd_cmd") else None
+                                        else:
+                                            line = None        # the lane freed at pd_ready went busy - local
+                                    except RuntimeError as e:
+                                        line = f"PLOAD ERR {e}"
+                                    if line and line.startswith("PLOAD OK"):
+                                        self.pd_note(f"hand-off: {len(ids) - 1} tokens' K/V from "
+                                                     f"the pool's P ({path.stat().st_size >> 20} MiB)")
+                                    else:
+                                        self.pd_note(f"hand-off refused ({(line or 'no answer').strip()}); "
+                                                     f"generating locally")
+                                    try:
+                                        path.unlink()
+                                    except OSError:
+                                        pass
                         segment_before = getattr(self.engine, "last", None)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
@@ -3991,6 +4376,30 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path == "/pd/busy":                   # PD: is a hand-off running? (the lane is serial)
+                self._json(200, {"busy": _PD_SEQ.locked()})
+                return
+            if path.startswith("/pd/blob/"):         # PD: a dump file, one download (the file goes with it)
+                name = path[len("/pd/blob/"):]
+                if svc.pd_role != "P" or "/" in name or "\\" in name or not name.startswith("pd-") \
+                        or not name.endswith(".bin"):
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
+                f = svc.pd_dir / name
+                if not f.is_file():
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
+                body = f.read_bytes()
+                try:
+                    f.unlink()                       # single-use: the D side fetches it once
+                except OSError:
+                    pass
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: front/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -4131,6 +4540,21 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
+                if path == "/pd/pread":                # PD: the D side's prompt read onto the P engine's lane
+                    self._pd_pread(req)
+                    return
+                if path == "/pd/dump":                 # PD: that lane to a dump file, its name back
+                    self._pd_dump()
+                    return
+                if path == "/pd/offer":                # PD: the read and the dump as one engine line
+                    self._pd_offer(req)
+                    return
+                if path == "/pd/pread_dump":           # PD 1110: PREAD+PDUMP in one http round - yarn K/V
+                    self._pd_pread_dump(req)           # for a scaled D (offer's read wraps the plain rotary)
+                    return
+                if path == "/pd/pread_stream":         # PD 1110 direct-IB: the dump pushed to the D's
+                    self._pd_pread_stream(req)         # one-shot listener - no file on this host
+                    return
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path == "/v1/chat/completions":
@@ -4508,6 +4932,158 @@ def make_handler(svc: Service):
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req
 
+        def _pd_pread(self, req):
+            """PD (the prefill hand-off): the D side's prompt, read onto this P engine's lane (PREAD, no
+            generation).  The answer is remembered for the /pd/dump that follows."""
+            if svc.pd_role != "P":
+                self._json(404, {"ok": False, "error": "this front is not a PD prefill side"})
+                return
+            ids = req.get("ids")
+            if not isinstance(ids, list) or not ids or len(ids) > 10_000_000 \
+                    or not all(isinstance(t, int) and not isinstance(t, bool) and 0 <= t < 1 << 31 for t in ids):
+                self._json(400, {"ok": False, "error": '"ids" must be a non-empty list of token ids'})
+                return
+            try:
+                line = svc.engine.pd_cmd("PREAD " + ",".join(str(int(t)) for t in ids), timeout=None)
+            except RuntimeError as e:
+                self._json(503, {"ok": False, "error": str(e)})
+                return
+            f = line.split()                  # "PREAD OK <slot> <tokens> <reused> <ms>"
+            if len(f) >= 5 and f[1] == "OK":
+                svc.pd_last = int(f[2]), int(f[3]), int(f[4])
+                self._json(200, {"ok": True, "slot": int(f[2]), "tokens": int(f[3]), "reused": int(f[4]),
+                                 "ms": float(f[5]) if len(f) > 5 and f[5].replace(".", "", 1).isdigit() else None})
+            else:
+                self._json(502, {"ok": False, "error": line.strip()})
+
+        def _pd_dump(self):
+            """PD: the lane /pd/pread filled onto a dump file (the engine's own format: tokens, every
+            card's state and K/V); one dump per pread - the name is single-use."""
+            if svc.pd_role != "P":
+                self._json(404, {"ok": False, "error": "this front is not a PD prefill side"})
+                return
+            last, svc.pd_last = svc.pd_last, None       # one shot: a second dump has no lane to read
+            if not last:
+                self._json(409, {"ok": False, "error": "no /pd/pread to dump (or it was dumped already)"})
+                return
+            slot = last[0]
+            name = "pd-" + uuid.uuid4().hex + ".bin"
+            path = svc.pd_dir / name
+            try:
+                line = svc.engine.pd_cmd(f"PDUMP {slot} {path}", timeout=None)
+            except RuntimeError as e:
+                self._json(503, {"ok": False, "error": str(e)})
+                return
+            f = line.split()                  # "PDUMP OK <tokens> <bytes>"
+            if len(f) >= 4 and f[1] == "OK":
+                self._json(200, {"ok": True, "name": name, "tokens": int(f[2]), "bytes": int(f[3])})
+            else:
+                self._json(502, {"ok": False, "error": line.strip()})
+
+        def _pd_offer(self, req):
+            """PD: /pd/pread and /pd/dump as one engine line (PDOFFER) - no local generation can land on
+            the lane between the read and the dump, and the read runs on the plain rotary (the engine
+            turns it on for a PDOFFER read), so the dump crosses to an unscaled D whatever this P runs."""
+            if svc.pd_role != "P":
+                self._json(404, {"ok": False, "error": "this front is not a PD prefill side"})
+                return
+            ids = req.get("ids")
+            if not isinstance(ids, list) or not ids or len(ids) > 10_000_000 \
+                    or not all(isinstance(t, int) and not isinstance(t, bool) and 0 <= t < 1 << 31 for t in ids):
+                self._json(400, {"ok": False, "error": '"ids" must be a non-empty list of token ids'})
+                return
+            name = "pd-" + uuid.uuid4().hex + ".bin"
+            path = svc.pd_dir / name
+            try:
+                line = svc.engine.pd_cmd("PDOFFER " + ",".join(str(int(t)) for t in ids) + " " + str(path),
+                                         timeout=None)
+            except RuntimeError as e:
+                self._json(503, {"ok": False, "error": str(e)})
+                return
+            f = line.split()                  # "PDOFFER OK <slot> <tokens> <reused> <bytes>"
+            if len(f) >= 6 and f[1] == "OK":
+                self._json(200, {"ok": True, "name": name, "slot": int(f[2]), "tokens": int(f[3]),
+                                 "reused": int(f[4]), "bytes": int(f[5])})
+            else:
+                self._json(502, {"ok": False, "error": line.strip()})
+
+        def _pd_pread_dump(self, req):
+            """PD 1110 (2P4D): /pd/pread and /pd/dump under ONE http round, so two D peers hand off
+            concurrently without racing the single pd_last slot.  The engine's own rotary (YaRN)
+            computes the K/V - the pair for a scaled D, unlike /pd/offer's plain-rotary read.
+            1110 fix: the PREAD/PDUMP pair holds _PD_SEQ - two Ds interleaving their reads let the
+            second PREAD park the first's lane, and the first's PDUMP then dumped an empty lane
+            (a 0-token dump the D loaded as garbage)."""
+            if svc.pd_role != "P":
+                self._json(404, {"ok": False, "error": "this front is not a PD prefill side"})
+                return
+            ids = req.get("ids")
+            if not isinstance(ids, list) or not ids or len(ids) > 10_000_000 \
+                    or not all(isinstance(t, int) and not isinstance(t, bool) and 0 <= t < 1 << 31 for t in ids):
+                self._json(400, {"ok": False, "error": '"ids" must be a non-empty list of token ids'})
+                return
+            name = "pd-" + uuid.uuid4().hex + ".bin"
+            path = svc.pd_dir / name
+            with _PD_SEQ:
+                try:
+                    line = svc.engine.pd_cmd("PREAD " + ",".join(str(int(t)) for t in ids), timeout=None)
+                except RuntimeError as e:
+                    self._json(503, {"ok": False, "error": str(e)})
+                    return
+                f = line.split()              # "PREAD OK <slot> <tokens> <reused> <ms>"
+                if not (len(f) >= 5 and f[1] == "OK"):
+                    self._json(502, {"ok": False, "error": line.strip()})
+                    return
+                reused = int(f[4])
+                try:
+                    line = svc.engine.pd_cmd(f"PDUMP {int(f[2])} {path}", timeout=None)
+                except RuntimeError as e:
+                    self._json(503, {"ok": False, "error": str(e)})
+                    return
+            f = line.split()                  # "PDUMP OK <tokens> <bytes>"
+            if len(f) >= 4 and f[1] == "OK" and int(f[2]) > 0:
+                self._json(200, {"ok": True, "name": name, "tokens": int(f[2]),
+                                 "reused": reused, "bytes": int(f[3])})
+            else:
+                self._json(502, {"ok": False, "error": f"bad dump ({line.strip()})"})
+
+        def _pd_pread_stream(self, req):
+            """PD 1110 (direct-IB step 1): the read AND the push in one round.  The D side has a
+            one-shot listener up (cb_host:cb_port, nonce); the engine's PDSTREAM reads the prompt
+            onto a lane and streams the dump's exact bytes to that listener - no file is written on
+            this host at all.  Same serialization as /pd/pread_dump (_PD_SEQ): the lane is one and
+            the push rides the same command."""
+            if svc.pd_role != "P":
+                self._json(404, {"ok": False, "error": "this front is not a PD prefill side"})
+                return
+            ids = req.get("ids")
+            if not isinstance(ids, list) or not ids or len(ids) > 10_000_000 \
+                    or not all(isinstance(t, int) and not isinstance(t, bool) and 0 <= t < 1 << 31 for t in ids):
+                self._json(400, {"ok": False, "error": '"ids" must be a non-empty list of token ids'})
+                return
+            cb = req.get("cb_host"), req.get("cb_port"), req.get("nonce")
+            if not isinstance(cb[0], str) or not cb[0] or not isinstance(cb[1], int) or not (0 < cb[1] < 65536) \
+                    or not isinstance(cb[2], str) or not cb[2]:
+                self._json(400, {"ok": False, "error": "cb_host, cb_port and nonce are required"})
+                return
+            t0 = time.time()
+            with _PD_SEQ:
+                try:
+                    line = svc.engine.pd_cmd(
+                        "PDSTREAM " + cb[0] + ":" + str(cb[1]) + " " + cb[2] + " "
+                        + ",".join(str(int(t)) for t in ids), timeout=None)
+                except RuntimeError as e:
+                    self._json(503, {"ok": False, "error": str(e)})
+                    return
+            f = line.split()                  # "PDSTREAM OK <slot> <tokens> <reused> <bytes>"
+            if len(f) >= 5 and f[1] == "OK" and int(f[3]) > 0:
+                print(f"[sfnx] PD streamed out in {time.time() - t0:.1f} s "
+                      f"({int(f[3])} tokens, {int(f[5]) >> 20} MiB)", flush=True)
+                self._json(200, {"ok": True, "tokens": int(f[3]), "reused": int(f[4]),
+                                 "bytes": int(f[5]), "ms": time.time() - t0})
+            else:
+                self._json(502, {"ok": False, "error": (line or "no answer").strip()})
+
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
@@ -4835,11 +5411,17 @@ CONFIG_KEYS = frozenset((
     # the server
     "tokenizer", "model_name", "host", "port", "api_key", "allowed_hosts", "api_monitor",
     # requests
-    "sampling", "reasoning_effort", "reasoning_budget_tokens", "reasoning_close_retry", "answer_room",
-    "fit_max_tokens", "repeat_stop_tokens", "anthropic_thinking"))
+    "sampling", "reasoning_effort", "reasoning_budget_tokens", "reasoning_close_retry",
+    "premature_stop_retry", "answer_room",
+    "fit_max_tokens", "repeat_stop_tokens", "anthropic_thinking",
+    # PD (the prefill hand-off): "P" = prefill side (serves /pd/*), "D" = decode side (hands off to
+    # pd_peers - the pool's P fronts; a lone pd_peer is a one-P pool)
+    "pd_role", "pd_peer", "pd_peers", "pd_peer_prefill", "pd_peer_timeout", "pd_dir",
+    # 1110 direct-IB: the dump pushed over a socket instead of a file + /pd/blob fetch
+    "pd_stream", "pd_stream_host"))
 # the "vision" section's keys (Vision.reader_args, vision_env and the CPU fallback read them)
 VISION_KEYS = frozenset(("exe", "cpu_exe", "mmproj", "model", "gpu", "threads", "max_tokens", "min_tokens",
-                         "cuda_device"))
+                         "cuda_device", "engine_tower"))
 
 
 def check_config_keys(cfg: dict, path) -> None:
@@ -5209,6 +5791,41 @@ def main(argv=None) -> int:
             and requested > 0 else 1
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.premature_stop_retry = cfg.get("premature_stop_retry") is True      # 1113: opt-in, off by default
+    # PD (the prefill hand-off): pd_role "P" (serve /pd/*) or "D" (hand off to pd_peer); the numbers a
+    # D side trusts: the peer's prefill rate (tok/s) and how long its HTTP answers may take.
+    svc.pd_role = str(cfg.get("pd_role") or "").upper() or None
+    if svc.pd_role not in (None, "P", "D"):
+        raise SystemExit(f'[sfnx] config pd_role must be "P" or "D", not {cfg.get("pd_role")!r}')
+    # 1111 P-pool: pd_peers lists every P (a D hands off to whichever the conversation's cache
+    # warmed); a lone pd_peer names a one-P pool (the 1110 shape, still accepted)
+    raw_peers = cfg.get("pd_peers")
+    if raw_peers is None and cfg.get("pd_peer"):
+        raw_peers = [cfg["pd_peer"]]
+    svc.pd_peers = [str(u).rstrip("/") for u in (raw_peers or []) if str(u).strip()] or None
+    svc._pd_rr = 0                            # the round-robin hand when every P is mid-read
+    svc._pd_park_lock = threading.Lock()      # 1111: requests parked on a peer P's serial read -
+    svc._pd_parked = 0                        # they hold no engine resource, so the idle check
+    # below must not read them as "others busy" (the self-reinforcing hand-off loop of 1111 prod:
+    # one parked request kept every later request handing off, the D's GPUs sat at 0% while both
+    # Ps ran back-to-back serial lanes)
+    svc.pd_peer_prefill = float(cfg.get("pd_peer_prefill") or 800.0)
+    svc.pd_peer_timeout = float(cfg.get("pd_peer_timeout") or 600.0)
+    svc.pd_dir = Path(cfg.get("pd_dir") or tempfile.gettempdir())
+    svc.pd_dir.mkdir(parents=True, exist_ok=True)
+    # 1110 direct-IB step 1: the hand-off's dump is pushed to a one-shot TCP listener on the D's
+    # front (engine PDSTREAM) instead of a file + /pd/blob fetch. Default on - the file path stays
+    # as the fallback for any peer still on the old engine (pd_stream off there).
+    svc.pd_stream = cfg.get("pd_stream") is not False
+    svc.pd_stream_host = str(cfg.get("pd_stream_host") or "")   # the address the P reaches us on
+    svc.pd_last = None            # the P side: the (slot, tokens) of the last /pd/pread
+    if svc.pd_role:
+        role = "prefill side (serves /pd/pread, /pd/dump, /pd/blob)" if svc.pd_role == "P" \
+            else ("decode side (hands long prompts to " +
+                  (", ".join(svc.pd_peers) if svc.pd_peers else "no P - set pd_peers") + ")")
+        print(f"[sfnx] PD: {role}", flush=True)
+        if svc.pd_role == "D" and not svc.pd_peers:
+            raise SystemExit('[sfnx] config pd_role "D" needs pd_peers (the P fronts\' URLs)')
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
